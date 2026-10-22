@@ -220,6 +220,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .pytest_cache
+.toresu-data/
 # Python virtual environments
 .venv/
 venv/

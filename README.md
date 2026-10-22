@@ -122,12 +122,16 @@ The VLM is instructed to preserve Japanese source text, avoid translating labels
 | **PyMuPDF** | Extracts native PDF text and word coordinates, and renders pages or selected regions. |
 | **PDF ingestion** | Preserves native and OCR text as separate page-numbered, source-tagged spans with bounding boxes; OCR is used only when a page lacks sufficient native text. |
 | **RapidOCR** | Optional CPU OCR engine used by PDF ingestion for scanned or text-sparse pages, using ONNX Runtime and an explicitly configured Japanese-capable recognition model. |
+| **Table reconstruction** | Deterministically groups existing page spans by geometry, detects numeric columns and headers, and preserves unresolved assignments and provenance; it does not execute OCR. |
+| **Financial normalization** | Normalizes supported Japanese values, explicitly evidenced units, exact-label metric mappings, and source-supported periods; does not validate accounting relationships. |
+| **Financial validation** | Evaluates evidence-complete Decimal equations and caller-configured cross-period warning thresholds; never changes normalized values. |
 | **Gemini API** | Interprets table images with table-specific Japanese context and helps resolve visual or structural ambiguities. |
 | **Japanese Financial Context Compiler** | Identifies statement context, fiscal periods, units, notation, Japanese labels, footnotes, and relevant evidence. |
 | **Python validation** | Checks schemas, numeric normalization, row/column assignments, period associations, hierarchy, and supported accounting relationships. |
 | **Optional HTML/XBRL evidence** | May be used to cross-check an aligned disclosure when the matching source is available; it is not assumed to exist for every table. |
 
 When a PDF contains a reliable text layer, native text extraction and coordinates from PyMuPDF should be preferred. RapidOCR is an explicit fallback for scanned pages or selected regions where native text is absent or requires OCR; it should not be run unconditionally on digitally generated pages. VLM inference is complementary; it does not replace all conventional extraction steps.
+Table reconstruction consumes the existing `PDFDocument` and `FinancialDocumentContext`; it never invokes OCR or a language model. It uses repeated numeric right-edge alignment as a column signal, text-span coverage for merged headers, and label indentation as a tentative parent-row signal. Geometry that does not establish a relationship remains unresolved or ambiguous.
 
 ## Evidence-Grounded Reconstruction
 
@@ -277,6 +281,80 @@ GEMINI_MODEL=
 
 The model identifier is configurable and is not assumed to be valid. The settings loader accepts both values empty, or requires both to be set. Do not commit `.env` or API credentials; `.env` is already ignored by Git. Select a model based on current API availability, supported image/PDF inputs, cost, and evaluation results.
 
+### Table Reconstruction
+
+Reconstruct source-backed table candidates from the existing ingestion and context results:
+
+```python
+from toresu.context_compiler import compile_financial_context
+from toresu.pdf_ingestion import ingest_pdf
+from toresu.table_reconstruction import reconstruct_tables
+
+document = ingest_pdf("report.pdf")
+context = compile_financial_context(document)
+result = reconstruct_tables(document, context)
+```
+
+The result keeps source-span provenance separate from inferred geometric cell boundaries. Missing values have no contributing spans and remain unresolved; competing column matches remain ambiguous. Periods are attached only when their original context evidence is also present in the header path. Unit candidates are retained from compiler context without converting values. Row indentation, horizontal alignment, and vertical grouping are deterministic heuristics, not verified accounting structure.
+
+### Financial Normalization
+
+Normalize reconstructed values and map row labels with the deterministic registry:
+
+```python
+from toresu.financial_normalization import normalize_financial_tables
+
+normalized = normalize_financial_tables(result, context)
+for observation in normalized.tables[0].observations:
+  print(
+    observation.metric.raw_label,
+    observation.metric.candidates,
+    observation.period.raw_label,
+    observation.value.parsed.raw_text,
+    observation.value.normalized_value,
+    observation.value.normalized_unit,
+  )
+```
+
+Supported numeric notation includes comma-grouped and full-width digits/punctuation, `△`/`▲` negatives, leading signs, parenthesized negatives, decimals, and `%` suffixes. Zero, blank, dash variants, unavailable markers, and unsupported notation remain distinct. Parentheses combined with a negative prefix, malformed grouping, and unrecognized strings are not normalized. Percentages remain percentage values; they are not divided by 100.
+
+Explicit `円`, `千円`, `百万円`, and `億円` declarations normalize amounts to yen using `Decimal`; the raw amount and declaration are retained. Conversion is blocked when a table unit is missing or conflicting. Metric mapping is an exact normalized-label lookup in an extensible `MetricRegistry`; unregistered and multiply mapped labels remain unresolved or ambiguous. Fiscal years, quarters, and dates are normalized only from supported explicit header evidence. Relative prior/current fiscal-year labels are preserved as relative periods without deriving calendar dates.
+
+This phase emits normalized observations with source evidence; accounting consistency checks are handled by the separate financial validation module.
+
+### Financial Validation
+
+Run deterministic checks on normalized observations:
+
+```python
+from decimal import Decimal
+
+from toresu.financial_validation import (
+  CrossPeriodThreshold,
+  MetricConcept,
+  ValidationConfig,
+  validate_financial_data,
+)
+
+report = validate_financial_data(
+  normalized,
+  config=ValidationConfig(
+    absolute_tolerance=Decimal("1"),
+    cross_period_thresholds=(
+      CrossPeriodThreshold(MetricConcept.REVENUE, Decimal("0.5")),
+    ),
+  ),
+)
+for finding in report.findings:
+  print(finding.status, finding.rule_id, finding.message)
+```
+
+The built-in assets = liabilities + equity rule runs only when required metrics have one compatible reporting period, resolved yen units, and usable mapped values. `absolute_tolerance` is an explicit residual allowance in normalized units; source values are not rounded or rewritten. `AccountingEquation` and the `ValidationRule` protocol allow additional checks, including cross-statement equations, to be supplied explicitly.
+
+Cross-period thresholds are opt-in and produce warnings for review, not failures. A nonzero current value after a zero baseline is reported as a warning because relative change is undefined. Findings retain the normalized observations and links to source tables, cells, text spans, pages, and bounding boxes.
+
+No subtotal identities or further cross-statement relationships are assumed by default. Missing/dash values, ambiguous mappings, unresolved periods, or incompatible units prevent a pass and are reported explicitly. Tests use synthetic evidence; validation has not been evaluated against real Japanese filings.
+
 ### Tests
 
 Run the configuration tests without a Gemini API key or API calls:
@@ -304,6 +382,9 @@ toresu/
 │   └── toresu/
 │       ├── __init__.py
 │       ├── config.py
+│       ├── context_compiler.py
+│       ├── financial_normalization.py
+│       ├── financial_validation.py
 │       ├── pdf_ingestion.py
 │       ├── japanese_ocr.py
 │       ├── table_detection.py
@@ -319,11 +400,14 @@ toresu/
 │   └── table.schema.json
 ├── tests/
 │   ├── test_config.py
+│   ├── test_context_compiler.py
+│   ├── test_financial_normalization.py
+│   ├── test_financial_validation.py
 │   ├── test_japanese_ocr.py
 │   ├── test_pdf_ingestion.py
+│   ├── test_table_reconstruction.py
 │   ├── test_japanese_normalization.py
 │   ├── test_period_and_unit_parsing.py
-│   ├── test_table_reconstruction.py
 │   └── test_validation.py
 ├── samples/
 │   └── README.md
@@ -347,4 +431,4 @@ This is a suggested layout; module names can change as the implementation evolve
 
 ## Status
 
-Toresu is a research-oriented implementation in progress. Implemented: PyMuPDF PDF ingestion with page-numbered native text spans, source bounding boxes, native-text sufficiency checks, and a separate RapidOCR fallback that preserves OCR text and confidence as distinct provenance-tagged spans. OCR model initialization remains lazy. Proposed: Japanese financial context compilation, table detection and reconstruction, context-aware Gemini inference, evidence validation, Streamlit review, and exports. The ingestion tests use generated PDFs and mocked OCR; no real financial PDF has been evaluated, and no accuracy or benchmark claim is made.
+Toresu is a research-oriented implementation in progress. Implemented: PyMuPDF PDF ingestion with page-numbered native text spans and conditional lazy RapidOCR; the deterministic Japanese context compiler; geometry-based table candidate reconstruction with source-backed and unresolved cells; Decimal-based value/unit/period normalization; and deterministic financial validation with a balance-sheet invariant, configurable equations/tolerances, and warning-only cross-period thresholds. Tests use synthetic evidence only; no real financial PDF has been evaluated, and no accuracy or benchmark claim is made. Reconstruction remains geometry-driven; semantic mapping is exact-registry based; validation requires compatible resolved evidence and does not modify source values. Proposed: Streamlit review and exports.

@@ -158,6 +158,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.venv-rapidocr
 
 # Spyder project settings
 .spyderproject
@@ -218,3 +219,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.pytest_cache
+# Python virtual environments
+.venv/
+venv/
+env/
+.venv-rapidocr/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

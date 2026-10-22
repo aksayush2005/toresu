@@ -72,9 +72,9 @@ The VLM is instructed to preserve Japanese source text, avoid translating labels
             (PyMuPDF)                   (PyMuPDF/PIL)
               |                                |
               v                                v
-    Japanese Text Extraction          Japanese OCR / Layout
-                                      and Table Recognition
-                                          (PaddleOCR)
+    Japanese Text Extraction          OCR fallback for pages
+                                        without usable native text
+                                          (RapidOCR + ONNX Runtime)
               |                                |
               +---------------+----------------+
                               |
@@ -119,14 +119,15 @@ The VLM is instructed to preserve Japanese source text, avoid translating labels
 | Component | Responsibility |
 |---|---|
 | **Streamlit** | Web interface for PDF upload, page preview, table review, warnings, and exports. |
-| **PyMuPDF** | Extracts native PDF text and coordinates, and renders pages or selected regions. |
-| **PaddleOCR** | Provides Japanese text recognition and document/table analysis for scanned or ambiguous regions. Use a Japanese-capable recognition configuration and benchmark it on the target documents. |
+| **PyMuPDF** | Extracts native PDF text and word coordinates, and renders pages or selected regions. |
+| **PDF ingestion** | Preserves native and OCR text as separate page-numbered, source-tagged spans with bounding boxes; OCR is used only when a page lacks sufficient native text. |
+| **RapidOCR** | Optional CPU OCR engine used by PDF ingestion for scanned or text-sparse pages, using ONNX Runtime and an explicitly configured Japanese-capable recognition model. |
 | **Gemini API** | Interprets table images with table-specific Japanese context and helps resolve visual or structural ambiguities. |
 | **Japanese Financial Context Compiler** | Identifies statement context, fiscal periods, units, notation, Japanese labels, footnotes, and relevant evidence. |
 | **Python validation** | Checks schemas, numeric normalization, row/column assignments, period associations, hierarchy, and supported accounting relationships. |
 | **Optional HTML/XBRL evidence** | May be used to cross-check an aligned disclosure when the matching source is available; it is not assumed to exist for every table. |
 
-When a PDF contains a reliable text layer, native text extraction should be preferred for exact characters. OCR is used where the text layer is absent, incomplete, or inconsistent with the rendered page. VLM inference is complementary; it does not replace all conventional extraction steps.
+When a PDF contains a reliable text layer, native text extraction and coordinates from PyMuPDF should be preferred. RapidOCR is an explicit fallback for scanned pages or selected regions where native text is absent or requires OCR; it should not be run unconditionally on digitally generated pages. VLM inference is complementary; it does not replace all conventional extraction steps.
 
 ## Evidence-Grounded Reconstruction
 
@@ -220,7 +221,7 @@ Experiments should compare native-text extraction, Japanese OCR/table recognitio
 - **Language:** Python
 - **Web interface:** Streamlit
 - **PDF text and rendering:** PyMuPDF
-- **Japanese OCR and table analysis:** PaddleOCR with an appropriate Japanese-capable model/configuration
+- **Japanese OCR fallback:** RapidOCR with ONNX Runtime on CPU; Japanese recognition uses the PP-OCRv6 small multilingual model route (`japan`), not RapidOCR's default Chinese/English recognition route
 - **Multimodal inference:** Gemini API, configured through environment variables
 - **Data processing:** Pandas and Python validation rules
 - **Testing:** Pytest
@@ -232,19 +233,18 @@ The initial implementation is designed to work without a local NVIDIA GPU. PDF p
 
 ### Requirements
 
-- Python 3.10 or newer
-- A Gemini API key
-- Internet access for API inference and model downloads
-- A CPU-compatible PaddlePaddle/PaddleOCR installation
+- Python 3.13.15 (verified with the selected dependency set on Ubuntu 26.04 x86_64)
+- `uv`, for installing the pinned Python runtime and creating the virtual environment
+- Internet access for package/model downloads and, when implemented, API inference
+- A Gemini API key only when Gemini inference is implemented
 
-Install a compatible PaddlePaddle build using the [official installation instructions](https://www.paddlepaddle.org.cn/en/install/quick). Then install PaddleOCR with a Japanese-capable recognition configuration. Dependency versions and model choices should be fixed after validating them on the target environment.
+RapidOCR recommends ONNX Runtime for CPU inference. Its model documentation lists `japan` for PP-OCRv6 small multilingual recognition; the tiny model does not include Japanese. Toresu configures the small model route explicitly rather than relying on RapidOCR's Chinese/English default. Model assets may be fetched on first OCR use, so configuration tests do not initialize OCR or download models.
 
 ### Installation
 
 ```bash
-git clone https://github.com/<your-username>/toresu.git
-cd toresu
-python -m venv .venv
+uv python install 3.13.15
+uv venv --python 3.13.15 --seed .venv
 ```
 
 Activate the virtual environment:
@@ -257,25 +257,33 @@ source .venv/bin/activate
 .venv\Scripts\Activate.ps1
 ```
 
-Install the base application dependencies:
+Install the dependencies from the single manifest:
 
 ```bash
-python -m pip install streamlit pymupdf pandas python-dotenv google-genai pytest
-python -m pip install paddleocr
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-If PaddleOCR reports a missing or incompatible PaddlePaddle installation, install a compatible build from the official guide linked above. Verify the Japanese recognition model and table-analysis pipeline on the sample documents before running a full evaluation.
+The dependency manifest installs `rapidocr` and the CPU `onnxruntime` engine. OCR remains optional at runtime: use PyMuPDF text and coordinates first, and call the OCR adapter only for scanned pages or selected regions that need recognition. Verify Japanese inference on representative financial-document samples before evaluating OCR accuracy.
 
 ### Environment Variables
 
-Create a `.env` file in the project root:
+Copy `.env.example` to `.env`. Both Gemini settings may remain empty during local development:
 
 ```dotenv
-GEMINI_API_KEY=your_api_key_here
-GEMINI_MODEL=your_selected_gemini_model
+GEMINI_API_KEY=
+GEMINI_MODEL=
 ```
 
-Do not commit `.env` or API credentials. Keep `.env` in `.gitignore`. Select the Gemini model based on current API availability, supported image/PDF inputs, cost, and evaluation results.
+The model identifier is configurable and is not assumed to be valid. The settings loader accepts both values empty, or requires both to be set. Do not commit `.env` or API credentials; `.env` is already ignored by Git. Select a model based on current API availability, supported image/PDF inputs, cost, and evaluation results.
+
+### Tests
+
+Run the configuration tests without a Gemini API key or API calls:
+
+```bash
+PYTHONPATH=src python -m pytest
+```
 
 ### Run the Application
 
@@ -294,6 +302,8 @@ toresu/
 ├── app.py
 ├── src/
 │   └── toresu/
+│       ├── __init__.py
+│       ├── config.py
 │       ├── pdf_ingestion.py
 │       ├── japanese_ocr.py
 │       ├── table_detection.py
@@ -308,6 +318,9 @@ toresu/
 ├── schemas/
 │   └── table.schema.json
 ├── tests/
+│   ├── test_config.py
+│   ├── test_japanese_ocr.py
+│   ├── test_pdf_ingestion.py
 │   ├── test_japanese_normalization.py
 │   ├── test_period_and_unit_parsing.py
 │   ├── test_table_reconstruction.py
@@ -327,10 +340,11 @@ This is a suggested layout; module names can change as the implementation evolve
 
 - [Financial Services Agency of Japan — EDINET overview](https://www.fsa.go.jp/search/20130917.html)
 - [Financial Services Agency of Japan — EDINET taxonomy intellectual property statement](https://www.fsa.go.jp/search/EDINET_Taxonomy_Legal_Statement.html)
-- [PaddleOCR documentation — OCR pipeline and supported language/model configurations](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html)
-- [PaddleOCR documentation — PP-StructureV3](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/PP-StructureV3.html)
+- [RapidOCR documentation — installation](https://rapidai.github.io/RapidOCRDocs/main/install_usage/rapidocr/install/)
+- [RapidOCR documentation — model list and language support](https://rapidai.github.io/RapidOCRDocs/main/model_list/)
+- [RapidOCR documentation — usage and result coordinates](https://rapidai.github.io/RapidOCRDocs/main/install_usage/rapidocr/usage/)
 - [NLI Research Institute — Japanese financial statements and negative-number notation](https://www.nli-research.co.jp/report/detail/id=75877?site=nli)
 
 ## Status
 
-Toresu is a proposed research-oriented implementation. Capabilities described here define the intended architecture and evaluation plan; they should not be interpreted as implemented functionality or benchmark results until supported by code and measurements.
+Toresu is a research-oriented implementation in progress. Implemented: PyMuPDF PDF ingestion with page-numbered native text spans, source bounding boxes, native-text sufficiency checks, and a separate RapidOCR fallback that preserves OCR text and confidence as distinct provenance-tagged spans. OCR model initialization remains lazy. Proposed: Japanese financial context compilation, table detection and reconstruction, context-aware Gemini inference, evidence validation, Streamlit review, and exports. The ingestion tests use generated PDFs and mocked OCR; no real financial PDF has been evaluated, and no accuracy or benchmark claim is made.

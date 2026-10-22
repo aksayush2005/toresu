@@ -1,349 +1,336 @@
-# VLM-First Japanese Financial Table Parser
+# Toresu — Japanese Financial Document Intelligence
 
-trace/toresu (Traceable Risk-Adaptive Cell Extraction) is a correctness-first document-intelligence pipeline for extracting structured tables from Japanese financial filing PDFs. It combines vision-language model (VLM) understanding with PDF text evidence, OCR, deterministic financial validation, and contradiction-guided re-inspection of uncertain regions. Its differentiator is not another extraction pass: it records evidence per cell and spends additional inference only where independent signals suggest the result may be wrong.
+Toresu is a research-oriented document-intelligence project for reconstructing **Japanese-language financial tables** from PDFs into structured, traceable data. Its initial target is the financial-statement tables found in Japanese corporate disclosures, especially annual securities reports (*有価証券報告書*) and consolidated financial statements.
 
-The initial implementation is designed to be completed under a two-day engineering deadline and to process collections of thousands of PDFs through bounded concurrency and resumable execution. The primary deliverable is a Python command-line tool. A lightweight Streamlit interface can be added for visual review and demonstration without becoming a dependency of the extraction engine.
+Toresu combines native PDF text extraction, Japanese OCR, table-structure recognition, and a vision-language model (VLM). Its defining component is a **Japanese Financial Context Compiler**: it extracts document-specific evidence and applies Japanese financial-document conventions before asking the VLM to interpret a table.
 
-## Objectives
+> **Design principle:** preserve the source, interpret Japanese financial notation in context, and flag uncertainty instead of silently inventing values.
 
-- Recover Japanese financial tables with accurate row labels, column associations, fiscal periods, units, section boundaries, and hierarchical structure.
-- Preserve the value exactly as printed before applying any normalization.
-- Minimize silent errors, especially wrong digits, signs, row/column shifts, omitted rows, and duplicated rows.
-- Use a VLM as the primary table-understanding and extraction component.
-- Use native PDF text, OCR, geometry, and accounting rules as complementary evidence and verification—not as substitutes for visual understanding.
-- Use contradiction-guided visual verification to re-examine only suspicious cells or table regions rather than repeatedly processing entire documents.
-- Separate visual transcription risk from structural row/column-assignment risk, and test validator coverage through controlled fault injection.
-- Support thousands of PDFs with bounded concurrency, checkpoints, retry limits, idempotent processing, and traceable failures.
-- Make uncertainty explicit and retain enough source evidence for a reviewer to verify an extracted value.
+## Why Toresu?
 
-## Design Principles
+Japanese financial tables contain ambiguities that generic PDF-to-Markdown pipelines do not specifically address. A parser must preserve Japanese account labels and table hierarchy, relate headers such as `前連結会計年度` and `当連結会計年度` to the correct periods, recognize unit declarations such as `千円` and `百万円`, and handle financial notation such as `△` or `▲` without confusing it with ordinary punctuation. Important context can also appear in Japanese section headings, notes, footnotes, or explanatory text surrounding a table.
 
-**Correctness before throughput.** Optimize for exact values and correct cell placement before maximizing pages per second.
+Toresu treats these details as part of the extraction architecture—not as afterthoughts in a generic prompt. It builds a Japanese financial context package for each table, supplies that evidence together with the table image and structural candidates, and validates the resulting reconstruction against the document.
 
-**VLM-first, evidence-grounded.** The VLM interprets visual layout and proposes structured cell data. It must not be trusted as ground truth or allowed to silently infer unreadable values.
+## Scope
 
-**Coarse-to-fine processing.** Understand the page and table first, then inspect high-resolution crops where small print, dense rows, or validation failures require additional attention.
+**Primary scope**
 
-**Preserve raw evidence.** Never overwrite source text or printed notation with normalized values. Both must remain available.
+- Japanese-language financial statements in PDF documents.
+- Balance sheets (`貸借対照表`), income statements (`損益計算書`), cash-flow statements (`キャッシュ・フロー計算書`), and statements of changes in equity (`株主資本等変動計算書`) when present in the input.
+- Tables with nested account categories, multi-row headers, merged cells, comparative reporting periods, units, notes, and footnote markers.
+- Documents that contain a native text layer, scanned pages, or a mixture of both.
 
-**Deterministic validation.** Use ordinary code for numeric parsing, schema checks, accounting arithmetic, and process state. Do not delegate arithmetic integrity or acceptance policy entirely to a generative model.
+**Source handling**
 
-**Review rather than guess.** A value that cannot be resolved from available evidence remains unresolved and is flagged for review.
+PDF is the primary input. If a matching HTML or XBRL source is provided or can legitimately be obtained, Toresu may use it as supplementary evidence. It must not assume that every PDF table has a directly usable structured counterpart, or that an auxiliary source always matches the rendered table exactly.
+
+Toresu is not intended to be a generic parser for every language or document type. Other use cases may become possible, but the first implementation and evaluation should focus on Japanese corporate financial disclosures.
+
+## Japanese-Specific Design
+
+### Japanese Financial Context Compiler
+
+For each table, the compiler assembles a structured context package from document evidence and Japanese financial-document rules. It is designed to identify or preserve:
+
+- **Statement identity:** Japanese table titles and section headings, including consolidated versus non-consolidated statements where the document makes the distinction.
+- **Fiscal-period headers:** expressions such as `前連結会計年度`, `当連結会計年度`, `前事業年度`, and `当事業年度`, including their relationship to explicit dates and column positions.
+- **Units and scale:** declarations such as `円`, `千円`, `百万円`, and `億円`; the raw declaration is retained, while a normalized scale is recorded separately when unambiguous.
+- **Japanese date formats:** western-calendar dates such as `2025年3月31日` and Japanese-era dates such as `令和7年3月31日`, alongside slash-separated formats. Conversion to ISO dates is only performed when the source date is explicit and unambiguous.
+- **Financial notation:** symbols such as `△` and `▲`, parenthesized values, and different dash-like characters. Their meaning is interpreted using the document and local table context; a dash is not automatically converted to zero.
+- **Japanese text normalization:** full-width and half-width character variants and Japanese punctuation. A normalized search or comparison form may be created, but the original source string is always retained.
+- **Account labels and hierarchy:** Japanese labels such as `資産の部`, `流動資産`, `負債の部`, and `純資産の部`, while preserving the original text and detected parent-child relationships.
+- **Notes and footnotes:** markers such as `※`, `（注）`, and numbered notes, with links to relevant explanatory text when it can be extracted.
+
+These are extraction rules and hypotheses, not permission to override the source. For example, a `△` symbol may often indicate a negative amount in Japanese financial statements, but the parser must still retain the raw value and flag cases where the interpretation is unclear.
+
+### Context-Aware Japanese VLM Prompting
+
+Toresu does not send the same generic prompt for every table. It creates a table-specific prompt from:
+
+1. The Japanese table image and detected cell geometry.
+2. The original Japanese title, headings, account labels, and nearby explanatory notes.
+3. Candidate header paths and fiscal-period associations.
+4. Verified units and date information, with links back to their source.
+5. Japanese-specific normalization rules and a strict output schema.
+
+The VLM is instructed to preserve Japanese source text, avoid translating labels unless a separate translation field is requested, keep raw and normalized values separate, and report ambiguity rather than guessing. Context is added only when relevant to the table and question being resolved.
 
 ## Architecture
 
-### 1. PDF Ingestion and Page Preparation
-
-Use PyMuPDF to open documents, extract native text and bounding boxes when available, inspect page dimensions, and render pages for visual analysis. Preserve stable source identifiers, page numbers, rendering settings, and coordinates so every result can be traced back to the original file.
-
-Native text is useful evidence for digitally generated PDFs, but reading order and layout may be unreliable. Scanned or image-based pages rely more heavily on rendered images and OCR. The pipeline should handle both without assuming that all PDFs have the same internal structure.
-
-### 2. VLM-Based Document and Table Understanding
-
-The VLM is the primary extraction engine. It should identify relevant financial tables and interpret their visible structure, including:
-
-- Table titles and statement type.
-- Reporting periods and multi-level column headers.
-- Japanese row labels and indentation-based hierarchy.
-- Section headings, subtotals, totals, and merged cells.
-- Numeric values, punctuation, negative-value notation, dashes, and blank cells.
-- Units such as thousands of yen (千円), and footnotes that affect interpretation.
-- Table continuation across pages, where relevant.
-
-The model must distinguish character transcription from structural understanding: a correctly read number assigned to the wrong fiscal-year column is still an extraction error. Extraction instructions should prohibit guessing, filling blank cells with inferred values, dropping printed symbols, or modifying a value to make totals balance.
-
-Use the company-provided VLM or inference endpoint if one is specified. Otherwise, evaluate a document-specialized VLM such as PaddleOCR-VL-1.6 on actual sample pages before choosing the model. Keep the model integration behind a small adapter so the provider or model can be changed without rewriting the pipeline.
-
-### 3. Coarse-to-Fine Table Reconstruction
-
-Use a staged visual strategy:
-
-1. **Page-level inspection:** identify page content, table regions, titles, reporting periods, and overall layout.
-2. **Table-level extraction:** reconstruct headers, row order, cell contents, column relationships, and row hierarchy.
-3. **Targeted region inspection:** render and re-read high-resolution crops when text is small, cells are ambiguous, sources disagree, or validation finds a likely error.
-
-A crop should retain enough surrounding context—including the row label, header, and neighboring rows—to reduce column and row-assignment errors. Escalation should be driven by concrete uncertainty signals rather than applying maximum-resolution processing to every page.
-
-### 4. Evidence Collection and Cell Provenance
-
-Maintain a cell-level evidence record. Each extracted cell should retain, where available:
-
-- Source document identifier and page number.
-- Table, row, and column identity.
-- Row label, column header, reporting period, and unit context.
-- Raw printed text exactly as transcribed.
-- Normalized value, if interpretation is unambiguous.
-- Source bounding box or crop coordinates.
-- Native PDF text and OCR observations.
-- Validation results, uncertainty indicators, and correction history.
-
-Evidence sources can disagree. PDF text may be out of reading order, OCR can misread characters, and a VLM can infer plausible but unsupported content. Resolve disagreement by inspecting the source region and related context. Agreement between two VLM responses alone is not proof of correctness.
-
-### 5. Numeric Normalization
-
-Keep raw transcription and normalized numeric interpretation in separate fields. Parse numeric values using explicit rules and decimal-safe arithmetic. Preserve the original Japanese labels, punctuation, negative notation, and units.
-
-Normalization must distinguish at least the following cases:
-
-- A printed numeric zero.
-- An explicit dash or other printed marker.
-- A genuinely empty cell.
-- An unreadable or unresolved cell.
-- A negative number indicated by the Japanese triangle symbol (△), parentheses, or another source convention.
-
-Never map all of these to zero or a generic null value. Apply unit conversions only when the table's unit is known and record the unit used. Do not infer an absent unit or sign solely from accounting expectations.
-
-### 6. Deterministic Structural and Financial Validation
-
-Validate extracted content outside the VLM.
-
-**Structural checks** include expected row widths, header-to-column associations, table shape, row order, hierarchy, merged-cell handling, and potential missing or duplicated rows.
-
-**Numeric checks** include parseability, sign preservation, separators, precision, units, and whether each value remains associated with the correct row and reporting period.
-
-**Accounting checks** compare subtotals and totals with component rows where the document provides enough information. Relationships such as total assets equalling total liabilities plus net assets may be checked when appropriate to the statement. Tolerate documented rounding and presentation differences. An arithmetic mismatch is a warning to investigate, not permission to alter the printed value.
-
-Every warning should include a reason and point to the affected row, column, and source region. Validation must not silently rewrite the transcription.
-
-### 7. Targeted Correction and Review
-
-When a validation or evidence check fails:
-
-1. Identify the affected cells and locate their source coordinates.
-2. Create a high-resolution crop with sufficient neighboring context.
-3. Ask the VLM to transcribe the visible region again without suggesting the expected answer.
-4. Compare the new transcription with the original result and available PDF/OCR evidence.
-5. Re-run the relevant structural and financial checks.
-6. Accept only when the evidence satisfies defined acceptance rules; otherwise mark the field or table as requiring review.
-
-Record the initial extraction and every correction attempt. Do not silently replace uncertain results. Keep review status separate from the extracted value so downstream users can distinguish output from verified output.
-
-## Signature Innovation: Contradiction-Guided Visual Verification (CGVV)
-
-Most simple document parsers use a one-pass pattern: send a page to a VLM, accept its JSON, and export the result. TRACE adds a targeted verification loop designed for financial tables, where a single incorrect digit, negative sign, or shifted column can invalidate otherwise plausible output.
-
-CGVV is an engineering contribution inspired by recent work on multimodal table-layout correction and separating visual uncertainty from reasoning uncertainty. It is not a claim that the underlying ideas are wholly new research; the differentiator is implementing them together for Japanese financial tables and measuring the benefit.
-
-### A. Two independent risk dimensions
-
-For each cell, track two different questions rather than relying on one self-reported model confidence score:
-
-- **Visual risk:** Is the printed content legible and transcribed correctly? Signals include low-resolution glyphs, VLM-versus-OCR disagreement, disagreement with native PDF text, and instability when the same source region is viewed at a higher resolution.
-- **Structural risk:** Is the content attached to the correct row, column, header, and reporting period? Signals include unexpected row widths, ambiguous multi-level headers, cell-coordinate misalignment, row or column shifts, and inconsistent table topology.
-
-The system should calculate an interpretable risk score from observable signals. Model-reported confidence can be retained as supplementary metadata, but it must not be the sole acceptance criterion. If OCR or native text is unavailable, mark that evidence as unavailable rather than treating it as agreement.
-
-### B. Evidence ledger for every cell
-
-Every candidate cell receives a traceable evidence record containing its source page and bounding box, raw transcription, normalized interpretation, row and column context, available PDF/OCR observations, checks that passed or failed, and any re-reading history. Store the raw printed value separately from the normalized numeric value. This makes disagreements inspectable and allows reviewers to locate the exact source region rather than rereading the whole PDF.
-
-### C. Adaptive challenge views
-
-When a cell or table crosses the risk threshold, do not simply resend the same full page with the same prompt. Generate a targeted view with enough context to answer the unresolved question:
-
-1. **Row view:** retain the row label and its values to verify transcription and row association.
-2. **Header/column view:** retain the relevant column header and nearby rows to verify fiscal-period association.
-3. **High-resolution cell-region view:** inspect tiny digits, separators, or negative symbols while preserving nearby labels.
-
-Use only the view or views that address the actual failure signal. Ask for transcription of visible evidence, not a value that would make the accounts balance. Compare the new observation with the original and available OCR/PDF evidence. A second VLM response is another observation—not ground truth—and agreement alone does not prove correctness.
-
-### D. Evidence-gated acceptance
-
-Route each table or cell into one of three states:
-
-- **Accepted:** the structure and value pass required checks and have no unresolved high-risk contradiction.
-- **Recheck:** a specific contradiction can be investigated with a targeted crop or an independent text observation.
-- **Review required:** ambiguity remains after bounded rechecks, or critical source evidence is unreadable.
-
-Accounting equations act as anomaly detectors, never as automatic correction instructions. For example, if a reported total does not reconcile, TRACE highlights the contributing rows for inspection; it must not change a printed number simply because another number satisfies the equation.
-
-### E. Validator mutation testing
-
-A distinctive, low-cost part of the implementation is a fault-injection test harness for the validation layer. Starting from manually checked tables or known-good structured outputs, generate controlled synthetic faults such as:
-
-- Flip a negative triangle (△) or remove a minus sign.
-- Change one digit or a decimal separator.
-- Shift a value into an adjacent fiscal-year column.
-- Replace an empty cell or dash with zero.
-- Drop or duplicate a row.
-- Corrupt a subtotal while leaving its component rows unchanged.
-
-Measure which injected faults are detected, which escape, and how often valid tables are falsely flagged. This does **not** measure real-world extraction accuracy; it measures the coverage and weaknesses of the validators. Pair it with a manually annotated real-document set to evaluate actual transcription quality.
-
-### F. Rendering-Aware Japanese Table Calibration
-
-A directly relevant 2026 study presented at the Japanese Society for Artificial Intelligence examines table structuring in Annual Securities Reports. It reports that image-processing choices—such as DPI, font/grid visibility, and rendering clarity—can matter more than text-only prompt adjustments, while domain context and constrained output provide additional benefits.
-
-Use that insight in a small calibration step before processing the corpus:
-
-1. Select a small, representative set of pages containing dense Japanese labels, small financial figures, and multi-level headers.
-2. Render these pages with a few controlled profiles (for example, moderate versus high DPI, with consistent scaling and no aggressive smoothing).
-3. Compare extraction results against manually checked values, cell placement, and row completeness.
-4. Choose one default profile and, if evidence supports it, a separate profile for unusually dense or low-quality pages.
-5. Save the chosen parameters in configuration so results are reproducible.
-
-Do not generate many image variants for every page. Calibrate once on development pages, then use targeted higher-resolution crops only when visual or structural risk warrants them. Preserve the original page coordinates when mapping crop-level results back to the source.
-
-This makes rendering resolution a measured system parameter rather than an arbitrary constant. The calibration set must be separate from the held-out evaluation set to avoid reporting tuning results as generalization.
-
-### G. Page-First Relevance Routing
-
-A 2026 ACL Industry Track study on long scanned financial documents found that localizing task-relevant pages before VLM extraction was a major contributor to end-to-end accuracy. Borrow this pattern for batch processing:
-
-- Inspect pages with cheap signals first: native text, page dimensions, headings, and lightweight OCR/layout cues.
-- Rank or classify pages likely to contain financial tables, headers, continuations, and related footnotes.
-- Run the primary VLM extraction on relevant pages and their necessary context pages instead of sending every page of a long filing to the model indiscriminately.
-- Keep the page-selection output auditable and make the filter conservative: if the signals are ambiguous, process the page rather than risk omitting a required table.
-- Track page-retrieval recall separately from extraction accuracy. A table never sent to the VLM is a missed table, not a successful extraction.
-
-This module reduces inference cost and irrelevant context while retaining the VLM as the central table-understanding engine. For an assignment where nearly every page contains a relevant table, disable or soften filtering rather than applying it blindly.
-
-### H. Visible-Evidence-First Output
-
-Generative OCR can complete text that is plausible but not actually visible. TRACE should therefore preserve two distinct fields: `raw_transcription` (what is visibly printed) and `normalized_value` (the machine-interpreted value). When a critical digit or sign cannot be read reliably, return an unresolved state instead of allowing context or accounting rules to fill it in.
-
-Evaluate unsupported-completion behavior separately from ordinary character accuracy. A system that returns blank values for everything is safe from hallucination but useless; a system that guesses plausible numbers is useful-looking but unsafe. Measure exact-match accuracy, unresolved/abstention rate, and visually unsupported-value rate together.
-
-### I. Demonstrate the improvement, not just the architecture
-
-On the same held-out sample pages, compare a baseline one-pass VLM extraction with TRACE's evidence-gated correction loop. Report:
-
-- Numeric exact match and cell-association accuracy before and after correction.
-- Errors detected, errors corrected, and false alarms.
-- Fraction of cells/tables escalated to review.
-- Additional VLM calls and approximate inference cost per page.
-- Detection rate on each injected-fault category.
-
-This gives reviewers a concrete ablation: does targeted verification improve financial-table correctness enough to justify its extra inference? Do not claim improvement until the evaluation results demonstrate it.
+```text
+                   Japanese Financial PDF
+            (e.g. a Japanese annual securities report)
+                              |
+                              v
+                       PDF Ingestion
+                              |
+              +---------------+----------------+
+              |                                |
+              v                                v
+     Native Text + Coordinates          Page Rendering
+            (PyMuPDF)                   (PyMuPDF/PIL)
+              |                                |
+              v                                v
+    Japanese Text Extraction          Japanese OCR / Layout
+                                      and Table Recognition
+                                          (PaddleOCR)
+              |                                |
+              +---------------+----------------+
+                              |
+                              v
+                Japanese Document Analysis
+       statement type, headings, fiscal periods, units,
+       Japanese date formats, notes, account labels
+                              |
+                              v
+             JAPANESE FINANCIAL CONTEXT COMPILER
+       context retrieval + header paths + cell geometry
+       notation rules + evidence links + output constraints
+                              |
+                              v
+              Context-Aware Gemini VLM Inference
+           table image + Japanese text + structure candidates
+                              |
+                              v
+                 Canonical Table Representation
+            raw Japanese strings + normalized values
+                 row hierarchy + cell coordinates
+                              |
+                              v
+                  Japanese-Aware Validation
+       period/column checks, unit checks, numeric notation,
+       hierarchy checks, footnote links, accounting warnings
+                              |
+                    +---------+---------+
+                    |                   |
+                    v                   v
+               Validated Cells      Uncertain Cells
+                                        |
+                                        v
+                              Targeted OCR / Crop / Context
+                                        |
+                                        v
+                              JSON / CSV / HTML Export
+```
+
+## Processing Components
+
+| Component | Responsibility |
+|---|---|
+| **Streamlit** | Web interface for PDF upload, page preview, table review, warnings, and exports. |
+| **PyMuPDF** | Extracts native PDF text and coordinates, and renders pages or selected regions. |
+| **PaddleOCR** | Provides Japanese text recognition and document/table analysis for scanned or ambiguous regions. Use a Japanese-capable recognition configuration and benchmark it on the target documents. |
+| **Gemini API** | Interprets table images with table-specific Japanese context and helps resolve visual or structural ambiguities. |
+| **Japanese Financial Context Compiler** | Identifies statement context, fiscal periods, units, notation, Japanese labels, footnotes, and relevant evidence. |
+| **Python validation** | Checks schemas, numeric normalization, row/column assignments, period associations, hierarchy, and supported accounting relationships. |
+| **Optional HTML/XBRL evidence** | May be used to cross-check an aligned disclosure when the matching source is available; it is not assumed to exist for every table. |
+
+When a PDF contains a reliable text layer, native text extraction should be preferred for exact characters. OCR is used where the text layer is absent, incomplete, or inconsistent with the rendered page. VLM inference is complementary; it does not replace all conventional extraction steps.
+
+## Evidence-Grounded Reconstruction
+
+Every extracted cell should be traceable to its source. Toresu keeps the original text and its normalized interpretation separate, associates cells with page coordinates, and records which component produced each candidate. Where multiple sources disagree, the system should retain the conflict for validation rather than silently selecting a plausible value.
+
+For example, different errors require different corrections:
+
+| Detected issue | Preferred response |
+|---|---|
+| An unclear Japanese character or digit | Re-run OCR on a higher-resolution crop and compare with native text if available. |
+| A value assigned to the wrong reporting period | Reconstruct the parent-header path and check fiscal-period context. |
+| An ambiguous unit declaration | Retrieve the relevant table heading, nearby note, or source context. |
+| A missing account-row relationship | Re-evaluate cell geometry, indentation, and Japanese section/account labels. |
+| A disagreement between PDF text and the VLM | Preserve both candidates, inspect their source evidence, and flag unresolved conflicts. |
+| A subtotal does not match its components | Emit a warning; do not overwrite the value to force arithmetic agreement. |
+
+## Output Format
+
+Toresu uses a canonical table representation before exporting to CSV or HTML. This preserves information that flat formats may lose, including merged cells, multi-level headers, and nested account rows.
+
+Illustrative JSON schema:
+
+```json
+{
+  "document_id": "report_001",
+  "language": "ja",
+  "page_number": 1,
+  "table_title_raw": "連結貸借対照表",
+  "unit": {
+    "raw_text": "千円",
+    "normalized_unit": "thousand_yen",
+    "source": "document_text"
+  },
+  "columns": [
+    {
+      "column_id": "col_1",
+      "header_path_raw": ["前連結会計年度"],
+      "reporting_date_raw": "2025年3月31日",
+      "reporting_date_iso": "2025-03-31"
+    },
+    {
+      "column_id": "col_2",
+      "header_path_raw": ["当連結会計年度"],
+      "reporting_date_raw": "2026年3月31日",
+      "reporting_date_iso": "2026-03-31"
+    }
+  ],
+  "rows": [
+    {
+      "row_id": "row_1",
+      "label_raw": "現金及び預金",
+      "parent_row_id": "row_current_assets",
+      "cells": [
+        {
+          "column_id": "col_1",
+          "raw_text": "2,002,429",
+          "normalized_value": 2002429,
+          "bounding_box": [100, 200, 240, 225],
+          "extraction_source": "pdf_text",
+          "validation_status": "pending"
+        }
+      ]
+    }
+  ],
+  "warnings": []
+}
+```
+
+The example illustrates the intended schema, not a claim that Toresu has already extracted or validated that table. The implementation should also support cell spans, multiple candidates, confidence estimates, footnote links, and source provenance. Original Japanese strings must remain available even when a normalized form is created.
+
+## Validation and Evaluation
+
+Evaluation should use manually verified Japanese financial tables from documents that are not duplicated across evaluation splits. Where a matching HTML or XBRL representation is available, it may help create or cross-check references after confirming that the table, period, scope, and units align.
+
+| Metric | What it evaluates |
+|---|---|
+| Japanese character error rate (CER) | Accuracy of recognized Japanese text, including kanji, kana, punctuation, and digits. |
+| Cell text exact match | Whether the original cell text matches the reference transcription. |
+| Numeric exact match | Whether normalized values are correct under documented notation and unit rules. |
+| Header/period accuracy | Whether multi-row headers and fiscal periods are associated with the correct columns. |
+| Row hierarchy accuracy | Whether parent-child account relationships are preserved. |
+| Unit and date accuracy | Whether Japanese unit declarations and explicit dates are normalized correctly. |
+| Merged-cell accuracy | Whether merged regions and cell spans are reconstructed correctly. |
+| Table completeness | Whether expected rows and cells have been recovered. |
+| Latency and inference cost | The time and API usage required per document or table. |
+
+Experiments should compare native-text extraction, Japanese OCR/table recognition, VLM-only extraction, context-aware VLM extraction, and validation with targeted reprocessing. All configurations should use the same test documents, normalization rules, and scoring scripts. Results must be measured; no accuracy improvement is assumed in advance.
 
 ## Technology Stack
 
-| Area | Recommended technology | Responsibility |
-|---|---|---|
-| Language | Python 3.11 | Core pipeline and validation logic |
-| PDF ingestion and rendering | PyMuPDF | Native text, page geometry, and rendering |
-| Image preparation | Pillow and OpenCV | Cropping, resizing, and image handling |
-| Primary document understanding | Company-provided VLM or evaluated document VLM | Visual table interpretation and structured extraction |
-| Secondary text evidence | PaddleOCR | OCR observations for comparison and verification |
-| Structured schema | Pydantic | Validate and normalize model responses into typed records |
-| Numeric handling | `decimal.Decimal` and explicit parsers | Preserve financial precision and parse numeric notation |
-| CLI | Typer | Batch processing and inspection commands |
-| Checkpointing | SQLite | Durable per-document and per-page processing state |
-| Identity and caching | SHA-256 content hashes and local file metadata | Idempotency and safe reuse of intermediate results |
-| Optional reviewer UI | Streamlit | Upload, table preview, source-region review, and exports |
-| Tests | pytest | Unit, integration, regression, and evaluation tests |
+- **Language:** Python
+- **Web interface:** Streamlit
+- **PDF text and rendering:** PyMuPDF
+- **Japanese OCR and table analysis:** PaddleOCR with an appropriate Japanese-capable model/configuration
+- **Multimodal inference:** Gemini API, configured through environment variables
+- **Data processing:** Pandas and Python validation rules
+- **Testing:** Pytest
+- **Exports:** JSON, CSV, and HTML
 
-The exact VLM deployment depends on the available endpoint, hardware, latency limits, and Japanese-document accuracy. Avoid unnecessary model hosting or fine-tuning during the initial two-day build.
+The initial implementation is designed to work without a local NVIDIA GPU. PDF processing and OCR can run on CPU, although performance depends on the selected OCR models, document complexity, and hardware. VLM inference is performed through the API.
 
-## Interfaces and Outputs
+## Getting Started
 
-### Command-Line Interface
+### Requirements
 
-The CLI is the primary interface. It should support:
+- Python 3.10 or newer
+- A Gemini API key
+- Internet access for API inference and model downloads
+- A CPU-compatible PaddlePaddle/PaddleOCR installation
 
-- Processing one PDF or a directory of PDFs.
-- Resuming interrupted or incomplete processing.
-- Re-running deterministic validation on existing results.
-- Inspecting a single document during development.
-- Producing machine-readable output and a summary of failures or review-required cases.
+Install a compatible PaddlePaddle build using the [official installation instructions](https://www.paddlepaddle.org.cn/en/install/quick). Then install PaddleOCR with a Japanese-capable recognition configuration. Dependency versions and model choices should be fixed after validating them on the target environment.
 
-Single-document inspection and batch processing must use the same underlying pipeline, not separate implementations.
+### Installation
 
-### Optional Streamlit Review Interface
+```bash
+git clone https://github.com/<your-username>/toresu.git
+cd toresu
+python -m venv .venv
+```
 
-If time permits after the parser and tests work end to end, add a minimal web interface that can:
+Activate the virtual environment:
 
-- Select or upload a PDF.
-- Display extracted tables alongside the source page or crop.
-- Highlight cells with unresolved evidence or failed validation.
-- Show the raw transcription, normalized value, and review status.
-- Export JSON and CSV results.
+```bash
+# Linux / macOS
+source .venv/bin/activate
 
-The UI is a thin layer over the parser. The extraction engine must remain usable without a web app. Packaging a standalone executable is out of scope unless explicitly required by the evaluator.
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+```
 
-### Output Contract
+Install the base application dependencies:
 
-The output should represent each document as pages, tables, headers, rows, and cells. At minimum, retain:
+```bash
+python -m pip install streamlit pymupdf pandas python-dotenv google-genai pytest
+python -m pip install paddleocr
+```
 
-- Document identity and processing status.
-- Table title, statement type, units, and reporting periods when identified.
-- Ordered row labels and hierarchical relationships.
-- Cell positions and header associations.
-- Raw printed content and normalized values where unambiguous.
-- Source page and coordinates.
-- Evidence observations, validation results, and review status.
+If PaddleOCR reports a missing or incompatible PaddlePaddle installation, install a compatible build from the official guide linked above. Verify the Japanese recognition model and table-analysis pipeline on the sample documents before running a full evaluation.
 
-The output format should be versioned so changes to the schema do not silently break downstream consumers. JSON is the canonical structured output; CSV can be provided as a convenience export for flat tables.
+### Environment Variables
 
-## Reliability for Thousands of PDFs
+Create a `.env` file in the project root:
 
-The initial design should use simple, durable processing rather than a large distributed platform.
+```dotenv
+GEMINI_API_KEY=your_api_key_here
+GEMINI_MODEL=your_selected_gemini_model
+```
 
-- **Bounded concurrency:** limit simultaneous inference requests according to endpoint capacity and rate limits.
-- **Checkpointing:** persist document and page status so completed work survives interruptions.
-- **Idempotency:** use stable source identity and content hashes to avoid duplicate records on re-runs.
-- **Retry policy:** retry transient infrastructure errors with bounded backoff; keep quality failures separate from service failures.
-- **Targeted reprocessing:** retry failed pages and uncertain regions instead of repeating successful work across the whole corpus.
-- **Resource control:** process documents incrementally and avoid retaining full-resolution page images unnecessarily.
-- **Traceable failures:** record the affected file and page, failure category, retry count, and actionable message.
-- **Configuration:** keep model settings, render resolution, concurrency, retry limits, and validation thresholds configurable.
+Do not commit `.env` or API credentials. Keep `.env` in `.gitignore`. Select the Gemini model based on current API availability, supported image/PDF inputs, cost, and evaluation results.
 
-A database server, message broker, distributed object store, or multi-service deployment is not required for the first version unless the execution environment demands it. SQLite and resumable local processing are sufficient starting points for a single-machine batch tool.
+### Run the Application
 
-## Evaluation
+Once `app.py` and the extraction modules are implemented:
 
-Build a small manually checked reference set from the actual sample PDFs before processing the full collection. Include ordinary pages and difficult cases: dense Japanese labels, small numeric text, multiple fiscal-year columns, section bands, negative triangles, dashes, subtotals, merged headers, and ambiguous cells.
+```bash
+streamlit run app.py
+```
 
-Measure at least:
+Streamlit will print a local URL for the application in the terminal.
 
-- **Numeric exact match:** exact value agreement, including sign and decimal precision.
-- **Cell association accuracy:** whether the value belongs to the correct row and column.
-- **Text accuracy:** transcription quality for Japanese row labels and raw values.
-- **Table structure accuracy:** correctness of header hierarchy, row order, and table shape.
-- **Row completeness:** missing, duplicated, or incorrectly split rows.
-- **Whole-table correctness:** the fraction of tables with all required cells and associations correct.
-- **Validation effectiveness:** genuine errors detected and correct extractions incorrectly flagged.
-- **Review rate:** fraction of cells and tables left unresolved.
-- **Processing reliability:** failure rate, retry behavior, and successful resumption after interruption.
+## Suggested Repository Structure
 
-Prioritize numeric exact match, correct cell association, row completeness, and whole-table correctness. Character accuracy alone is insufficient when a single value can be shifted into a different fiscal-year column. Evaluate targeted correction by checking whether it resolves real errors without changing already-correct cells.
+```text
+toresu/
+├── app.py
+├── src/
+│   └── toresu/
+│       ├── pdf_ingestion.py
+│       ├── japanese_ocr.py
+│       ├── table_detection.py
+│       ├── context_compiler.py
+│       ├── japanese_finance_rules.py
+│       ├── vlm_extraction.py
+│       ├── reconstruction.py
+│       ├── validation.py
+│       └── export.py
+├── prompts/
+│   └── japanese_financial_table.txt
+├── schemas/
+│   └── table.schema.json
+├── tests/
+│   ├── test_japanese_normalization.py
+│   ├── test_period_and_unit_parsing.py
+│   ├── test_table_reconstruction.py
+│   └── test_validation.py
+├── samples/
+│   └── README.md
+├── outputs/
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+```
 
-Do not claim a general accuracy percentage based solely on a small development sample. Report the evaluation set size, its composition, and each metric separately.
+This is a suggested layout; module names can change as the implementation evolves.
 
-## Security and Data Handling
+## References
 
-Treat source PDFs and extracted financial data as sensitive unless the assignment explicitly states otherwise. Do not send documents to third-party model services unless their use is authorized. Keep credentials out of source control, restrict logs from dumping full document contents, and retain only the source regions needed for debugging and review. Document any external inference provider used by the implementation.
+- [Financial Services Agency of Japan — EDINET overview](https://www.fsa.go.jp/search/20130917.html)
+- [Financial Services Agency of Japan — EDINET taxonomy intellectual property statement](https://www.fsa.go.jp/search/EDINET_Taxonomy_Legal_Statement.html)
+- [PaddleOCR documentation — OCR pipeline and supported language/model configurations](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html)
+- [PaddleOCR documentation — PP-StructureV3](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/PP-StructureV3.html)
+- [NLI Research Institute — Japanese financial statements and negative-number notation](https://www.nli-research.co.jp/report/detail/id=75877?site=nli)
 
-## Innovation References
+## Status
 
-- [Structuring Financial Unstructured Data Using Multimodal Generative AI Models (JSAI 2026)](https://www.jstage.jst.go.jp/article/pjsai/JSAI2026/0/JSAI2026_2F6OS19b02/_article/-char/en) directly studies Japanese Annual Securities Reports and reports that rendering clarity, DPI, and grid/font visibility materially affect cell localization and value extraction; domain context and constrained output also help.
-- [A Multistage Extraction Pipeline for Long Scanned Financial Documents (ACL Industry Track 2026)](https://aclanthology.org/2026.acl-industry.99/) evaluates 120 production KYC documents comprising roughly 3,000 multilingual scanned pages. Its multistage approach with page-level retrieval, OCR, and VLM extraction improved field-level accuracy versus direct PDF-to-VLM baselines; the paper reports page retrieval as a dominant factor in its setting.
-- [A Multimodal Data Extraction Pipeline with Table Layout Correction (PMLR 2026)](https://proceedings.mlr.press/v318/yao26a.html) motivates explicit multimodal table-structure correction before schema-based extraction.
-- [Zero-Shot Table Extraction in Business Documents: A Unified Benchmark with Error Taxonomy and Ecological Analysis (WACV 2026)](https://openaccess.thecvf.com/content/WACV2026/html/Thomas_Zero-Shot_Table_Extraction_in_Business_Documents_A_Unified_Benchmark_with_WACV_2026_paper.html) motivates tracking actionable table errors such as missed/merged tables, header-body confusions, and incorrect cell topology rather than reporting only a single accuracy score.
-- [Hallucination-aware evaluation and confidence-guided selective routing for hybrid VLM-OCR (IJDAR 2026)](https://link.springer.com/article/10.1007/s10032-026-00620-7) studies visually unsupported transcription and the accuracy/latency trade-off of routing uncertain cases from OCR to a stronger VLM. Its results also show why abstention and hallucination risk should be reported separately from character error rate.
-- [VL-Calibration: Decoupled Confidence Calibration for Large Vision-Language Models Reasoning (ACL 2026)](https://aclanthology.org/2026.acl-long.2074/) motivates separating visual-grounding uncertainty from reasoning uncertainty rather than relying on a single holistic confidence score.
-
-These works are design inspiration, not proof that TRACE will outperform an unmodified VLM. Their reported results were obtained on different datasets and document types; validate the effect on the target Japanese filings.
-
-## Research Motivation
-
-TRACE combines recent directions while remaining implementable without training a new model:
-
-- **Rendering-aware extraction:** calibrate resolution and image preprocessing on Japanese statement pages before choosing a production profile.
-- **Page-first relevance routing:** find relevant financial tables before spending VLM calls on long reports, while measuring retrieval recall so filtering does not silently omit tables.
-- **Coarse-to-fine inspection:** use full-page context followed by high-resolution regional inspection for difficult cells.
-- **Multimodal structural correction:** compare the candidate table with source-image evidence and repair row/column structure before final serialization.
-- **Evidence-gated acceptance:** treat unsupported values, unresolved ambiguity, and model disagreement as distinct states rather than using one confidence number.
-- **Selective re-inspection:** spend extra inference only where observed evidence or validation indicates risk.
-
-These papers motivate design choices; their results do not establish accuracy on the assignment documents. The actual model, rendering profile, risk thresholds, and acceptance rules must be evaluated against manually verified Japanese financial tables.
-
-## Scope and Priorities
-
-The essential deliverable is a complete, testable path from PDF input to validated structured output. Prioritize reliable rendering, VLM extraction, provenance, raw-value preservation, deterministic checks, targeted correction, resumability, and regression tests.
-
-Keep the optional UI small and defer model fine-tuning, large-scale distributed orchestration, elaborate dashboards, and executable packaging unless they are explicit requirements. A compact, well-tested extraction engine with transparent failure handling is more valuable than a broader application that cannot demonstrate numerical correctness.
-
-## Expected Result
-
-A VLM-first parser that reconstructs Japanese financial tables, retains their original notation and hierarchy, validates extracted values with deterministic rules, re-examines suspicious regions, and marks unresolved cases instead of guessing. The pipeline should be easy to inspect and resume, suitable for processing thousands of PDFs, and demonstrably evaluated against manually verified examples.
+Toresu is a proposed research-oriented implementation. Capabilities described here define the intended architecture and evaluation plan; they should not be interpreted as implemented functionality or benchmark results until supported by code and measurements.

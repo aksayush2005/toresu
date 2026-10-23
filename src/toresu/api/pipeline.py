@@ -8,6 +8,7 @@ from typing import Callable
 import pymupdf
 
 from ..context_compiler import FinancialDocumentContext, compile_financial_context
+from ..document_intelligence import build_document_report
 from ..financial_normalization import (
     FinancialNormalizationResult,
     NormalizedObservation,
@@ -250,6 +251,7 @@ def _table_response(table: ReconstructedTable) -> TableResponse:
             period_label_raw=column.reporting_period.raw_label if column.reporting_period else None,
             period_status=column.period_status.value,
             geometry_status=column.geometry_status.value,
+            is_auxiliary=column.is_auxiliary,
         )
         for column in table.columns
     )
@@ -275,6 +277,7 @@ def _table_response(table: ReconstructedTable) -> TableResponse:
             )
             for row in table.rows
         ),
+        context_spans=tuple(_span_response(span) for span in table.context_spans),
         status=table.status.value,
         issues=table.issues,
     )
@@ -302,6 +305,9 @@ def _observation_response(observation: NormalizedObservation) -> NormalizedObser
         row_id=observation.source_row.row_id,
         cell_id=observation.source_cell.cell_id,
         row_label_raw=observation.metric.raw_label,
+        row_label_source_spans=tuple(
+            _span_response(span) for span in observation.metric.evidence_spans
+        ),
         metric_candidates=tuple(item.value for item in observation.metric.candidates),
         metric_status=observation.metric.status.value,
         metric_issue=observation.metric.issue,
@@ -317,6 +323,11 @@ def _observation_response(observation: NormalizedObservation) -> NormalizedObser
         unit_status=observation.value.unit_status.value,
         issue=observation.value.issue,
         source_spans=tuple(_span_response(span) for span in observation.value.evidence_spans),
+        unit_source_spans=tuple(
+            _span_response(span)
+            for unit_fact in observation.value.unit_candidates
+            for span in unit_fact.evidence.source_spans
+        ),
     )
 
 
@@ -370,6 +381,11 @@ def result_response(
         validation_findings=findings,
         stage_errors=stage_errors,
         warnings=tuple(artifacts.warnings),
+        document_report=(
+            build_document_report(artifacts.normalization, artifacts.validation)
+            if artifacts.normalization
+            else None
+        ),
     )
 
 

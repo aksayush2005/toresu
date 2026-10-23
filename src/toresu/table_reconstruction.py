@@ -30,6 +30,7 @@ class AssignmentStatus(str, Enum):
 class CellRole(str, Enum):
     ROW_LABEL = "row_label"
     VALUE = "value"
+    AUXILIARY = "auxiliary"
     HEADER = "header"
     UNCLASSIFIED = "unclassified"
 
@@ -85,6 +86,7 @@ class ReconstructedColumn:
     reporting_period_candidates: tuple[ReportingPeriodFact, ...]
     period_status: AssignmentStatus
     geometry_status: AssignmentStatus
+    is_auxiliary: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,7 @@ class _ColumnAnchor:
     right: float
     center: float
     supporting_lines: frozenset[int]
+    is_auxiliary: bool = False
 
 
 def reconstruct_tables(
@@ -252,10 +255,32 @@ def _reconstruct_block(
     table_index: int,
     tolerance: float,
 ) -> ReconstructedTable | None:
-    raw_anchors = _numeric_anchors(block, tolerance)
-    raw_anchors = _add_period_header_anchors(raw_anchors, block, context, tolerance)
+    date_span_ids = {
+        id(span)
+        for date_fact in context.reporting_dates
+        for span in date_fact.evidence.source_spans
+    }
+    period_header_span_ids = {
+        id(span)
+        for period in context.reporting_periods
+        for span in period.evidence.source_spans
+        if period.raw_label in span.raw_text
+    }
+    date_header_groups = _date_header_groups(context)
+    raw_anchors = _numeric_anchors(block, tolerance, date_span_ids)
+    if len(raw_anchors) < 2:
+        raw_anchors = _add_period_header_anchors(
+            raw_anchors, block, context, tolerance
+        )
     first_numeric_line = min(
-        (line_index for line_index, line in enumerate(block) if any(_is_numeric_span(span) for span in line.spans)),
+        (
+            line_index
+            for line_index, line in enumerate(block)
+            if any(
+                id(span) not in date_span_ids and _is_numeric_span(span)
+                for span in line.spans
+            )
+        ),
         default=len(block),
     )
     anchors = [
@@ -275,12 +300,22 @@ def _reconstruct_block(
         if line_index < first_numeric_line:
             continue
         per_column: dict[int, list[TextSpan]] = {}
+        sign_markers = _sign_markers_by_value(line)
+        marker_span_ids = {
+            id(marker)
+            for markers in sign_markers.values()
+            for marker in markers
+        }
         for span in line.spans:
+            if id(span) in date_span_ids or id(span) in marker_span_ids:
+                continue
             if not _looks_like_value_span(span, anchors, tolerance):
                 continue
             candidates = _anchor_candidates(span, anchors, tolerance)
             if len(candidates) == 1:
-                per_column.setdefault(candidates[0], []).append(span)
+                per_column.setdefault(candidates[0], []).extend(
+                    (*sign_markers.get(id(span), ()), span)
+                )
             elif len(candidates) > 1:
                 ambiguous_numeric.setdefault(line_index, []).append((span, candidates))
         if per_column or line_index in ambiguous_numeric:
@@ -298,8 +333,37 @@ def _reconstruct_block(
         context,
         unit_facts,
         title_facts,
+        date_span_ids,
+    )
+    auxiliary_anchors, auxiliary_header_spans = _auxiliary_column_anchors(
+        block,
+        header_line_indexes,
+        data_line_indexes,
+        anchors,
         tolerance,
     )
+    first_auxiliary_column = len(anchors)
+    rightmost_value_edge = max(anchor.right for anchor in anchors)
+    anchors.extend(auxiliary_anchors)
+    assigned_auxiliary: dict[int, dict[int, list[TextSpan]]] = {}
+    for line_index in data_line_indexes:
+        line = block[line_index]
+        for span in line.spans:
+            if _is_numeric_span(span) or span.bounding_box[0] <= rightmost_value_edge:
+                continue
+            center = (span.bounding_box[0] + span.bounding_box[2]) / 2
+            matching_headers = [
+                (abs(center - header_center), offset)
+                for offset, (header_center, header_tolerance) in enumerate(
+                    auxiliary_header_spans
+                )
+                if abs(center - header_center) <= header_tolerance
+            ]
+            if matching_headers:
+                _, auxiliary_offset = min(matching_headers)
+                assigned_auxiliary.setdefault(line_index, {}).setdefault(
+                    first_auxiliary_column + auxiliary_offset, []
+                ).append(span)
     last_header_index = max(header_line_indexes, default=-1)
     last_data_index = data_line_indexes[-1]
     row_line_indexes = [
@@ -332,6 +396,9 @@ def _reconstruct_block(
         title_facts,
         table_id,
         tolerance,
+        date_span_ids,
+        period_header_span_ids,
+        date_header_groups,
     )
     columns = _build_columns(anchors, headers, context)
     rows = _build_rows(
@@ -344,6 +411,7 @@ def _reconstruct_block(
         table_id,
         tolerance,
         row_ambiguous,
+        assigned_auxiliary,
     )
     contributing = [line.bounding_box for line in block]
     table_bbox = _union_bbox(contributing)
@@ -368,11 +436,16 @@ def _reconstruct_block(
     )
 
 
-def _numeric_anchors(lines: list[_Line], tolerance: float) -> list[_ColumnAnchor]:
+def _numeric_anchors(
+    lines: list[_Line],
+    tolerance: float,
+    excluded_span_ids: set[int] | None = None,
+) -> list[_ColumnAnchor]:
+    excluded_span_ids = excluded_span_ids or set()
     observations = []
     for line_index, line in enumerate(lines):
         for span in line.spans:
-            if _is_numeric_span(span):
+            if id(span) not in excluded_span_ids and _is_numeric_span(span):
                 observations.append((span.bounding_box[2], line_index, span))
     observations.sort(key=lambda item: (item[0], item[1], item[2].bounding_box[0]))
     groups: list[list[tuple[float, int, TextSpan]]] = []
@@ -403,6 +476,152 @@ def _numeric_anchors(lines: list[_Line], tolerance: float) -> list[_ColumnAnchor
             )
         )
     return anchors
+
+
+def _sign_markers_by_value(line: _Line) -> dict[int, tuple[TextSpan, ...]]:
+    markers: dict[int, tuple[TextSpan, ...]] = {}
+    for marker in line.spans:
+        if marker.raw_text.strip() not in {"△", "▲"}:
+            continue
+        candidates = [
+            value
+            for value in line.spans
+            if _is_numeric_span(value)
+            and -1.0
+            <= value.bounding_box[0] - marker.bounding_box[2]
+            <= 2.0
+            and abs(
+                (value.bounding_box[1] + value.bounding_box[3]) / 2
+                - (marker.bounding_box[1] + marker.bounding_box[3]) / 2
+            )
+            <= 2.0
+        ]
+        if candidates:
+            value = min(candidates, key=lambda item: item.bounding_box[0])
+            markers[id(value)] = (*markers.get(id(value), ()), marker)
+    return markers
+
+
+def _date_header_groups(
+    context: FinancialDocumentContext,
+) -> tuple[tuple[str, str | None, tuple[TextSpan, ...]], ...]:
+    groups = []
+    seen: set[tuple[str, tuple[int, ...]]] = set()
+    line_positions: dict[tuple[int, ...], int] = {}
+    for date_fact in context.reporting_dates:
+        source_spans = date_fact.evidence.source_spans
+        span_key = tuple(id(span) for span in source_spans)
+        compact_parts = [
+            "".join(
+                character
+                for character in unicodedata.normalize("NFKC", span.raw_text)
+                if not character.isspace()
+            )
+            for span in source_spans
+        ]
+        compact_line = "".join(compact_parts)
+        compact_date = "".join(
+            character
+            for character in unicodedata.normalize("NFKC", date_fact.raw_text)
+            if not character.isspace()
+        )
+        start = compact_line.find(compact_date, line_positions.get(span_key, 0))
+        if start < 0:
+            continue
+        end = start + len(compact_date)
+        line_positions[span_key] = end
+        selected = []
+        offset = 0
+        for span, part in zip(source_spans, compact_parts):
+            part_end = offset + len(part)
+            if offset < end and part_end > start:
+                selected.append(span)
+            offset = part_end
+        if selected:
+            selected_key = tuple(id(span) for span in selected)
+            group_key = (date_fact.raw_text.strip(), selected_key)
+            if group_key in seen:
+                continue
+            seen.add(group_key)
+            compact_date_position = start
+            matching_periods = []
+            for period in context.reporting_periods:
+                period_span_ids = {
+                    id(span) for span in period.evidence.source_spans
+                }
+                if not period_span_ids.intersection(span_key):
+                    continue
+                compact_label = "".join(
+                    character
+                    for character in unicodedata.normalize("NFKC", period.raw_label)
+                    if not character.isspace()
+                )
+                label_position = compact_line.find(compact_label)
+                if label_position >= 0 and label_position <= compact_date_position:
+                    matching_periods.append((label_position, period.raw_label))
+            period_label = (
+                max(matching_periods, default=(0, None), key=lambda item: item[0])[1]
+            )
+            groups.append(
+                (date_fact.raw_text.strip(), period_label, tuple(selected))
+            )
+    return tuple(groups)
+
+
+def _auxiliary_column_anchors(
+    block: list[_Line],
+    header_line_indexes: list[int],
+    data_line_indexes: list[int],
+    numeric_anchors: list[_ColumnAnchor],
+    tolerance: float,
+) -> tuple[list[_ColumnAnchor], list[tuple[float, float]]]:
+    """Find text columns with a header and row cells aligned beyond value columns."""
+    if not numeric_anchors:
+        return [], []
+    rightmost_value_edge = max(anchor.right for anchor in numeric_anchors)
+    candidates = []
+    for line_index in header_line_indexes:
+        for span in block[line_index].spans:
+            if span.bounding_box[0] <= rightmost_value_edge:
+                continue
+            center = (span.bounding_box[0] + span.bounding_box[2]) / 2
+            width = span.bounding_box[2] - span.bounding_box[0]
+            matching_spans = []
+            for data_line_index in data_line_indexes:
+                for cell_span in block[data_line_index].spans:
+                    if _is_numeric_span(cell_span):
+                        continue
+                    cell_center = (
+                        cell_span.bounding_box[0] + cell_span.bounding_box[2]
+                    ) / 2
+                    if (
+                        cell_span.bounding_box[0] > rightmost_value_edge
+                        and abs(cell_center - center)
+                        <= max(tolerance, width * 0.5)
+                    ):
+                        matching_spans.append((data_line_index, cell_span))
+            if matching_spans:
+                candidates.append((span, center, width, matching_spans))
+
+    anchors = []
+    headers = []
+    for span, center, width, matching_spans in candidates:
+        matched = [item[1] for item in matching_spans]
+        anchors.append(
+            _ColumnAnchor(
+                right_edge=statistics.median(item.bounding_box[2] for item in matched),
+                left=statistics.median(item.bounding_box[0] for item in matched),
+                right=statistics.median(item.bounding_box[2] for item in matched),
+                center=statistics.median(
+                    (item.bounding_box[0] + item.bounding_box[2]) / 2
+                    for item in matched
+                ),
+                supporting_lines=frozenset(item[0] for item in matching_spans),
+                is_auxiliary=True,
+            )
+        )
+        headers.append((center, max(tolerance, width * 0.5)))
+    return anchors, headers
 
 
 def _add_period_header_anchors(
@@ -498,7 +717,7 @@ def _detect_header_lines(
     context: FinancialDocumentContext,
     units: tuple[FinancialUnitFact, ...],
     titles: tuple[StatementTitleFact, ...],
-    tolerance: float,
+    date_span_ids: set[int],
 ) -> list[int]:
     excluded_ids = {
         id(span)
@@ -509,6 +728,9 @@ def _detect_header_lines(
     headers = []
     for line_index in range(first_data_index):
         line = block[line_index]
+        if any(id(span) in date_span_ids for span in line.spans):
+            headers.append(line_index)
+            continue
         content_spans = [span for span in line.spans if id(span) not in excluded_ids]
         if not content_spans:
             continue
@@ -539,6 +761,9 @@ def _build_header_cells(
     titles: tuple[StatementTitleFact, ...],
     table_id: str,
     tolerance: float,
+    date_span_ids: set[int],
+    period_header_span_ids: set[int],
+    date_header_groups: tuple[tuple[str, str | None, tuple[TextSpan, ...]], ...],
 ) -> list[ReconstructedHeaderCell]:
     excluded_span_ids = {
         id(span)
@@ -556,47 +781,160 @@ def _build_header_cells(
     header_lines = [line_spans for line_spans in header_lines if line_spans]
     headers = []
     for header_row, spans in enumerate(header_lines):
-        for span_index, span in enumerate(spans):
+        grouped_spans: dict[int, list[TextSpan]] = {}
+        merged_headers = []
+        unresolved_headers = []
+        current_span_ids = {id(span) for span in spans}
+        shared_span_groups = [
+            group
+            for group in date_header_groups
+            if any(id(span) in current_span_ids for span in group[2])
+        ]
+        for date_index, (raw_date, period_label, date_spans) in enumerate(
+            date_header_groups
+        ):
+            selected_date_spans = tuple(
+                span for span in date_spans if id(span) in current_span_ids
+            )
+            if not selected_date_spans:
+                continue
+            date_bbox = _union_bbox(
+                [span.bounding_box for span in selected_date_spans]
+            )
+            center_x = (date_bbox[0] + date_bbox[2]) / 2
+            groups_for_same_span = [
+                group
+                for group in shared_span_groups
+                if set(id(span) for span in group[2])
+                == set(id(span) for span in selected_date_spans)
+            ]
+            if (
+                len(groups_for_same_span) == len(anchors)
+                and len(groups_for_same_span) > 1
+            ):
+                column_index = groups_for_same_span.index(
+                    (raw_date, period_label, date_spans)
+                )
+            else:
+                column_index = min(
+                    range(len(anchors)),
+                    key=lambda item: abs(anchors[item].center - center_x),
+                )
+            if period_label:
+                headers.append(
+                    ReconstructedHeaderCell(
+                        header_id=f"{table_id}-h{header_row + 1}-p{date_index + 1}",
+                        header_row=header_row,
+                        raw_text=period_label,
+                        column_start=column_index,
+                        column_span=1,
+                        is_merged=False,
+                        provenance=_cell_provenance(selected_date_spans),
+                        cell_boundary=date_bbox,
+                        status=AssignmentStatus.INFERRED,
+                    )
+                )
+            headers.append(
+                ReconstructedHeaderCell(
+                    header_id=f"{table_id}-h{header_row + 1}-d{date_index + 1}",
+                    header_row=header_row,
+                    raw_text=raw_date,
+                    column_start=column_index,
+                    column_span=1,
+                    is_merged=False,
+                    provenance=_cell_provenance(selected_date_spans),
+                    cell_boundary=date_bbox,
+                    status=AssignmentStatus.INFERRED,
+                )
+            )
+        for span in spans:
+            if id(span) in date_span_ids:
+                continue
             covered = [
                 column_index
                 for column_index, anchor in enumerate(anchors)
                 if span.bounding_box[0] <= anchor.center <= span.bounding_box[2]
             ]
-            issue = None
             if len(covered) >= 2:
-                column_start = min(covered)
-                column_span = max(covered) - column_start + 1
-                status = AssignmentStatus.INFERRED
-                issue = "Header span geometrically covers multiple value columns."
-            else:
+                merged_headers.append((span, min(covered), max(covered) - min(covered) + 1))
+                continue
+
+            if id(span) in period_header_span_ids:
                 center_x = (span.bounding_box[0] + span.bounding_box[2]) / 2
-                nearest = min(
+                column_index = min(
                     range(len(anchors)),
-                    key=lambda item: abs(anchors[item].center - center_x),
+                    key=lambda item: min(
+                        abs(anchors[item].center - center_x),
+                        abs(anchors[item].right_edge - span.bounding_box[2]),
+                    ),
                 )
-                if abs(anchors[nearest].center - center_x) <= max(
-                    tolerance, (anchors[nearest].right - anchors[nearest].left)
+                anchor = anchors[column_index]
+                alignment_tolerance = max(tolerance, anchor.right - anchor.left)
+                if (
+                    abs(anchor.center - center_x) <= alignment_tolerance
+                    or abs(anchor.right_edge - span.bounding_box[2])
+                    <= alignment_tolerance
                 ):
-                    column_start = nearest
-                    column_span = 1
-                    status = AssignmentStatus.INFERRED
+                    grouped_spans.setdefault(column_index, []).append(span)
                 else:
-                    column_start = None
-                    column_span = 1
-                    status = AssignmentStatus.UNRESOLVED
-                    issue = "Header text has no supported alignment with a value column."
+                    unresolved_headers.append(span)
+                continue
+
+            center_x = (span.bounding_box[0] + span.bounding_box[2]) / 2
+            nearest = min(
+                range(len(anchors)),
+                key=lambda item: abs(anchors[item].center - center_x),
+            )
+            if abs(anchors[nearest].center - center_x) <= max(
+                tolerance, (anchors[nearest].right - anchors[nearest].left)
+            ):
+                grouped_spans.setdefault(nearest, []).append(span)
+            else:
+                unresolved_headers.append(span)
+
+        for column_index, grouped in grouped_spans.items():
+            bbox = _union_bbox([span.bounding_box for span in grouped])
             headers.append(
                 ReconstructedHeaderCell(
-                    header_id=f"{table_id}-h{header_row + 1}-s{span_index + 1}",
+                    header_id=f"{table_id}-h{header_row + 1}-c{column_index + 1}",
+                    header_row=header_row,
+                    raw_text="".join(span.raw_text for span in grouped).strip(),
+                    column_start=column_index,
+                    column_span=1,
+                    is_merged=False,
+                    provenance=_cell_provenance(tuple(grouped)),
+                    cell_boundary=bbox,
+                    status=AssignmentStatus.INFERRED,
+                )
+            )
+        for span_index, (span, column_start, column_span) in enumerate(merged_headers):
+            headers.append(
+                ReconstructedHeaderCell(
+                    header_id=f"{table_id}-h{header_row + 1}-m{span_index + 1}",
                     header_row=header_row,
                     raw_text=span.raw_text,
                     column_start=column_start,
                     column_span=column_span,
-                    is_merged=column_span > 1,
+                    is_merged=True,
                     provenance=_cell_provenance((span,)),
                     cell_boundary=span.bounding_box,
-                    status=status,
-                    issue=issue,
+                    status=AssignmentStatus.INFERRED,
+                    issue="Header span geometrically covers multiple value columns.",
+                )
+            )
+        for span_index, span in enumerate(unresolved_headers):
+            headers.append(
+                ReconstructedHeaderCell(
+                    header_id=f"{table_id}-h{header_row + 1}-u{span_index + 1}",
+                    header_row=header_row,
+                    raw_text=span.raw_text,
+                    column_start=None,
+                    column_span=1,
+                    is_merged=False,
+                    provenance=_cell_provenance((span,)),
+                    cell_boundary=span.bounding_box,
+                    status=AssignmentStatus.UNRESOLVED,
+                    issue="Header text has no supported alignment with a value column.",
                 )
             )
     return headers
@@ -646,6 +984,7 @@ def _build_columns(
                 reporting_period_candidates=tuple(period_candidates),
                 period_status=period_status,
                 geometry_status=AssignmentStatus.INFERRED,
+                is_auxiliary=anchor.is_auxiliary,
             )
         )
     return columns
@@ -661,6 +1000,7 @@ def _build_rows(
     table_id: str,
     tolerance: float,
     ambiguous_numeric: dict[int, list[tuple[TextSpan, tuple[int, ...]]]],
+    assigned_auxiliary: dict[int, dict[int, list[TextSpan]]],
 ) -> list[ReconstructedRow]:
     rows: list[ReconstructedRow] = []
     hierarchy_stack: list[tuple[float, str]] = []
@@ -708,7 +1048,11 @@ def _build_rows(
 
         cells = []
         for column_index, anchor in enumerate(anchors):
-            spans = tuple(numeric_by_col.get(column_index, ()))
+            spans = tuple(
+                assigned_auxiliary.get(line_index, {}).get(column_index, ())
+                if anchor.is_auxiliary
+                else numeric_by_col.get(column_index, ())
+            )
             if not spans:
                 column = columns[column_index]
                 cell_box = (
@@ -720,7 +1064,11 @@ def _build_rows(
                 cells.append(
                     ReconstructedCell(
                         cell_id=f"{row_id}-c{column_index + 1}",
-                        role=CellRole.VALUE,
+                        role=(
+                            CellRole.AUXILIARY
+                            if anchor.is_auxiliary
+                            else CellRole.VALUE
+                        ),
                         raw_text=None,
                         provenance=CellProvenance(
                             page_number=line.page_number,
@@ -748,8 +1096,38 @@ def _build_rows(
                 continue
 
             raw_text = _joined_raw_text(spans)
+            if anchor.is_auxiliary:
+                cells.append(
+                    ReconstructedCell(
+                        cell_id=f"{row_id}-c{column_index + 1}",
+                        role=CellRole.AUXILIARY,
+                        raw_text=raw_text,
+                        provenance=_cell_provenance(spans),
+                        cell_boundary=(
+                            columns[column_index].left,
+                            line.bounding_box[1],
+                            columns[column_index].right,
+                            line.bounding_box[3],
+                        ),
+                        row_index=row_index,
+                        column_index=column_index,
+                        column_span=1,
+                        numeric_interpretation=None,
+                        unit_fact=None,
+                        unit_status=AssignmentStatus.UNRESOLVED,
+                        status=AssignmentStatus.RESOLVED,
+                    )
+                )
+                continue
             if len(spans) == 1:
                 interpretation = parse_numeric_value(spans[0].raw_text.strip())
+            elif (
+                len(spans) == 2
+                and spans[0].raw_text.strip() in {"△", "▲"}
+                and _is_numeric_span(spans[1])
+            ):
+                raw_text = spans[0].raw_text.strip() + spans[1].raw_text.strip()
+                interpretation = parse_numeric_value(raw_text)
             else:
                 interpretation = NumericInterpretation(
                     raw_text=raw_text,

@@ -351,7 +351,7 @@ for finding in report.findings:
 
 The built-in assets = liabilities + equity rule runs only when required metrics have one compatible reporting period, resolved yen units, and usable mapped values. `absolute_tolerance` is an explicit residual allowance in normalized units; source values are not rounded or rewritten. `AccountingEquation` and the `ValidationRule` protocol allow additional checks, including cross-statement equations, to be supplied explicitly.
 
-Cross-period thresholds are opt-in and produce warnings for review, not failures. A nonzero current value after a zero baseline is reported as a warning because relative change is undefined. Findings retain the normalized observations and links to source tables, cells, text spans, pages, and bounding boxes.
+Cross-period thresholds are opt-in and produce warnings for review, not failures. A nonzero current value after a zero baseline is reported as a warning because relative change is undefined. Findings retain the normalized observations and links to source tables, cells, text spans, pages, and bounding boxes. The document report also spells out each expected relationship, observed residual and tolerance, and the source-linked normalized inputs used for the check.
 
 No subtotal identities or further cross-statement relationships are assumed by default. Missing/dash values, ambiguous mappings, unresolved periods, or incompatible units prevent a pass and are reported explicitly. Tests use synthetic evidence; validation has not been evaluated against real Japanese filings.
 
@@ -365,60 +365,160 @@ PYTHONPATH=src python -m pytest
 
 ### Run the Application
 
-Once `app.py` and the extraction modules are implemented:
+Start the local API in one terminal:
 
 ```bash
-streamlit run app.py
+PYTHONPATH=src uvicorn toresu.api.app:app --host 127.0.0.1 --port 8000
 ```
 
-Streamlit will print a local URL for the application in the terminal.
+Start the visual PDF inspection interface in another terminal:
 
-## Suggested Repository Structure
+```bash
+streamlit run src/toresu/viewer.py
+```
+
+The viewer adds the repository's `src/` directory to its import path when launched from a source checkout, so this command does not require the package to be installed or `PYTHONPATH` to be set. The viewer uploads selected PDFs to the existing local API, polls each job, and displays page renders with provenance spans and inferred table/cell boundaries in distinct colors. Selecting an observation exposes raw and normalized values, units, period, extraction origin, and source coordinates; the page summary distinguishes native text from OCR spans. Each reconstructed table includes a CSV download matching its displayed rows and columns, and a ZIP download contains every selected source PDF and the CSV exports for processed tables.
+
+The table `status` column describes data extraction: `resolved` means the label and populated value cells have resolved source evidence; `incomplete` means one or more expected value cells are blank; `ambiguous` means a value has competing assignments; `unresolved` means required label/value evidence could not be assigned; `heading` marks a label-only row; and `inferred` marks populated cells with inferred assignments. `hierarchy_status` is reported separately and describes parent-row assignment, not whether the row's values were extracted. Aligned auxiliary text columns such as notes are retained with provenance and are not interpreted as numeric values. The viewer does not edit or overwrite pipeline results. Use the default loopback API URL unless the local API is intentionally running on another address.
+
+The Metrics Dashboard reports operational counts for processed documents, pages, table candidates, structurally reconstructed tables, rows, columns, inferred/unresolved cells and rows, and wall-clock processing time when available. Select a processed document and table and upload a UTF-8 reference CSV to calculate ground-truth metrics. Without a reference, accuracy fields are shown as **Not evaluated**. Mismatch rows include table/page identity and available source-span text and coordinates; the original rendering, provenance overlays, and CSV downloads are unchanged.
+
+Reference comparisons use these explicit rules: row labels and headers follow the evaluation framework's Unicode NFKC normalization with whitespace removed; cell exact match trims surrounding whitespace only; numeric accuracy accepts valid comma grouping and `Decimal`-equivalent precision. Dashes, blank cells, zero, `△`, and minus signs are not rewritten or treated as interchangeable. Cell precision/recall/F1 counts non-empty values at their row/column positions; row-label precision/recall/F1 and structural agreement are reported separately. Header order and row order are significant, so period shifts and row shifts are reported as alignment mismatches. Metrics describe only the selected reference comparison, not general extraction accuracy.
+
+### Evaluation and Benchmarking
+
+The evaluation runner invokes the existing deterministic pipeline; it does not generate labels or change production behavior. The checked-in versioned dataset is `evaluation/datasets/v1/`:
 
 ```text
-toresu/
-├── app.py
-├── src/
-│   └── toresu/
-│       ├── __init__.py
-│       ├── config.py
-│       ├── context_compiler.py
-│       ├── financial_normalization.py
-│       ├── financial_validation.py
-│       ├── pdf_ingestion.py
-│       ├── japanese_ocr.py
-│       ├── table_detection.py
-│       ├── context_compiler.py
-│       ├── japanese_finance_rules.py
-│       ├── vlm_extraction.py
-│       ├── reconstruction.py
-│       ├── validation.py
-│       └── export.py
-├── prompts/
-│   └── japanese_financial_table.txt
-├── schemas/
-│   └── table.schema.json
-├── tests/
-│   ├── test_config.py
-│   ├── test_context_compiler.py
-│   ├── test_financial_normalization.py
-│   ├── test_financial_validation.py
-│   ├── test_japanese_ocr.py
-│   ├── test_pdf_ingestion.py
-│   ├── test_table_reconstruction.py
-│   ├── test_japanese_normalization.py
-│   ├── test_period_and_unit_parsing.py
-│   └── test_validation.py
-├── samples/
-│   └── README.md
-├── outputs/
-├── .env.example
-├── .gitignore
-├── requirements.txt
-└── README.md
+evaluation/
+├── datasets/v1/
+│   ├── manifest.json
+│   ├── sources/                 # synthetic PDF layout specs or source PDFs
+│   └── annotations/             # ground truth, separate from predictions
+└── schemas/annotation-v1.schema.json
 ```
 
-This is a suggested layout; module names can change as the implementation evolves.
+Each manifest entry has a stable `document_id`, a `source_kind` (`synthetic_pdf` or `pdf`), a source path, and a separate annotation path. Annotation files carry document metadata, annotation completeness, and optional processing metadata. Table labels can include hierarchical column headers, table and column bounds, and cell-level resolved/ambiguous/missing/unresolvable status. Synthetic layouts are rendered to temporary PDFs using PyMuPDF's built-in Japanese font and then run through the same pipeline as a PDF source. Add real documents by storing a legally usable PDF under the dataset directory, setting `source_kind` to `pdf`, and adding a ground-truth annotation file. Do not put sensitive or licensed documents in the repository without permission.
+
+Annotations preserve original text and distinguish parsed and normalized numeric values, units, semantic metric labels, raw and normalized periods, and extraction origin. They can cover multiple tables, pages, and periods. Explicit `exhaustive` flags define whether an empty or partial label set may be used to count false positives; unspecified labels are rejected by schema validation rather than interpreted as negatives. `validation_findings: null` means validation was not annotated, not that no finding was expected. Labeled validation findings include rule ID, status, and optional period. Optional page numbers and bounding boxes enable source localization scoring. The Pydantic loader validates the versioned manifest, annotation, and synthetic-layout structures; the corresponding annotation contract is documented in `evaluation/schemas/annotation-v1.schema.json`.
+
+Run accuracy evaluation or the separate performance benchmark without Gemini credentials:
+
+```bash
+env -u GEMINI_API_KEY -u GEMINI_MODEL PYTHONPATH=src .venv-rapidocr/bin/python -m toresu.evaluation evaluate --output-dir /tmp/toresu-evaluation
+env -u GEMINI_API_KEY -u GEMINI_MODEL PYTHONPATH=src .venv-rapidocr/bin/python -m toresu.evaluation benchmark --repeats 5 --warmup 1 --output-dir /tmp/toresu-benchmark
+```
+
+Use `--dataset PATH` to select another versioned dataset and repeat `--document DOCUMENT_ID` to select a subset. Each command writes a JSON report and a readable text summary. Evaluation reports per-document outcomes, processing failures, stage durations, error categories, prediction counts, and document-macro aggregate metrics. Processing failures remain in the denominator as failures and are not silently dropped; aggregate component metrics are averaged only over documents where that metric is defined, with their support count shown. Label matching uses Unicode NFKC plus whitespace removal; numeric comparisons use exact `Decimal` equality, not float tolerances. CER is character-based. Japanese WER is a deterministic character-token approximation: contiguous Japanese runs are split into Unicode code points, while ASCII alphanumeric runs remain tokens; it is not a morphological word segmentation score. Empty references use a denominator floor of one, yielding zero only for an empty prediction.
+
+The runner reports text CER/WER and extraction source counts; context precision/recall/F1; table counts, row labels, periods, header text, cell observations, and page localization; parsed/normalized value, unit, kind, metric, and period accuracies; validation-status agreement when labeled; and provenance coverage, page accuracy, and bounding-box IoU when box labels are supplied. Geometry is not inferred from annotation absence. Benchmarking separately reports per-document wall and per-page latency, stage latency, successful-run throughput, and Python-traced peak allocations; PDF rendering for synthetic inputs is excluded from timings, warm-up runs are excluded, and native-library allocations are not included in `tracemalloc` figures. Measurements are machine- and workload-specific.
+
+An abbreviated excerpt from the checked-in synthetic dataset's evaluation report:
+
+```json
+{
+  "dataset_version": "1.0.0",
+  "successful_documents": 1,
+  "failed_documents": 0,
+  "documents": [{
+    "document_id": "synthetic-jp-income-v1",
+    "source_kind": "synthetic_pdf",
+    "success": true,
+    "metrics": {
+      "text": {"cer": 0.0, "wer": 0.0},
+      "financial_validation": null,
+      "provenance": {"coverage": 1.0}
+    }
+  }]
+}
+```
+
+The starter dataset contains **one synthetic, native-text Japanese income-statement fixture**, generated from a compact PDF layout. It covers context extraction, two reporting periods, exact-label mapping, decimal/unit normalization, negative notation, table reconstruction, and value provenance. It has no real PDFs, scanned/OCR pages, or validation labels; those metrics are therefore unavailable, not perfect. Any scores from this fixture are synthetic pipeline checks only and do not estimate real-document accuracy or statistical significance. The evaluation set must be expanded and independently annotated before drawing broader conclusions.
+
+### Document-Level Financial Report
+
+The completed API result includes a `document_report` when normalization produced observations. It retains observation references and source spans, groups exact resolved metric identities across distinct statement types only when their reporting-period identities are compatible, and reports incompatible units or duplicate candidates instead of selecting a value. Cross-period comparisons are limited to matching period families and statement types, use `Decimal`, report absolute change, and define percentage change as `(current - prior) / abs(prior) * 100`; percentage change is unavailable for a zero prior value. Existing validation findings are copied into the report with provenance references, expected relationships, observed residuals/tolerances, and the normalized inputs used. Unresolved metric/value/period observations remain listed with reasons.
+
+Narrative-to-table reconciliation is not implemented: the current context compiler does not classify narrative figures into typed, period- and unit-linked observations. Restatements are also not inferred. The viewer exposes available cross-statement links, comparisons, consistency findings, and unresolved ambiguities under Document-level intelligence.
+
+### Research Experiment
+
+Run the reproducible research analysis with:
+
+```bash
+PYTHONPATH=src python -m toresu.research --dataset evaluation/datasets/v1 --output-dir research-results
+```
+
+The report will separate the full pipeline's exact financial-observation accuracy, component metrics, provenance coverage, and measured latency from a deliberately simple native-PDF numeric-token baseline. The token baseline measures raw-number candidate precision/recall and text-extraction latency only; it cannot assign figures to metrics or periods and is not presented as a like-for-like financial-observation system. The current pipeline has no independent switches for provenance-aware or ambiguity-aware decisions, and the starter set has no ambiguous mappings or real documents. Therefore those causal ablations, silent-error comparisons, and any statistical conclusion are explicitly marked not estimable until switchable variants and a broader independent dataset are available.
+
+### API Service
+
+Start the FastAPI service inside the project environment:
+
+```bash
+uvicorn toresu.api.app:app --host 127.0.0.1 --port 8000
+```
+
+The API processes PDFs asynchronously using the existing pipeline:
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| `GET` | `/health` | Liveness response. |
+| `GET` | `/ready` | Readiness and available job slots. |
+| `GET` | `/v1/config` | Public upload, page, worker, queue, and retention limits. |
+| `POST` | `/v1/documents` | Upload a PDF as multipart field `file`; returns `202` and job URLs. |
+| `GET` | `/v1/jobs/{job_id}` | Job state and per-stage status/errors. |
+| `GET` | `/v1/jobs/{job_id}/result` | Tables, normalized observations, document-level links/comparisons, provenance, and partial stage errors. Returns `409` while active. |
+| `GET` | `/v1/jobs/{job_id}/validation` | Validation findings and stage errors. Returns `409` while active. |
+
+`/health` reports process liveness independently of capacity. `/ready` returns `status: "ready"` and `accepting_jobs: true` while at least one job slot is available; when workers and the configured queue are full, it remains a live service but reports `status: "not_ready"`, `accepting_jobs: false`, and zero available slots.
+
+Example upload and polling:
+
+```bash
+curl http://127.0.0.1:8000/ready
+curl -F 'file=@report.pdf;type=application/pdf' http://127.0.0.1:8000/v1/documents
+curl http://127.0.0.1:8000/v1/jobs/<job-id>
+curl http://127.0.0.1:8000/v1/jobs/<job-id>/result
+```
+
+Example readiness response:
+
+```json
+{
+  "status": "ready",
+  "accepting_jobs": true,
+  "available_worker_slots": 10
+}
+```
+
+The server checks the `%PDF-` signature, then validates readability, encryption, page count, and the configured byte limit. Client filenames and MIME types are not used as paths or trusted for format validation. Error responses use `{ "error_code": "...", "detail": "..." }`. Financial `Decimal` fields serialize as JSON strings to preserve precision. Completed results can include partial upstream artifacts and identify the failed stage.
+
+API settings are read from the project working directory's `.env` file and the process environment; explicit environment variables take precedence:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `TORESU_API_DATA_DIR` | `.toresu-data` | Private local upload, staging, and result directory. |
+| `TORESU_API_MAX_UPLOAD_BYTES` | `52428800` | Maximum uploaded file size (50 MiB). |
+| `TORESU_API_MAX_PDF_PAGES` | `500` | Maximum PDF pages. |
+| `TORESU_API_MAX_WORKERS` | `2` | Concurrent processing workers. |
+| `TORESU_API_MAX_QUEUED_JOBS` | `8` | Additional admitted jobs waiting for workers. |
+| `TORESU_API_MAX_RETAINED_JOBS` | `100` | Maximum in-memory job records; oldest terminal jobs are pruned. |
+| `TORESU_API_VALIDATION_ABSOLUTE_TOLERANCE` | `0` | Decimal residual tolerance in normalized units. |
+| `TORESU_API_REVENUE_CHANGE_THRESHOLD` | unset | Optional relative-change warning threshold, such as `0.5` for 50%. |
+
+Job metadata is held in process memory and is **not durable**. Uploads and atomic result JSON live under UUID-named job directories; temporary upload staging is removed after acceptance/rejection, and abandoned API artifacts are cleared on startup. This is a single-process service, not a distributed queue. Do not run multiple workers/processes against the same data directory.
+
+The API has no authentication or authorization. Financial PDFs and results may contain sensitive information; keep the service bound to loopback for development. Before any public or shared deployment, add authentication/authorization, HTTPS, network restrictions, storage encryption/retention controls, and production monitoring. This implementation is not claimed to be production-ready.
+
+## Key Implementation Areas
+
+- `src/toresu/api/`: bounded asynchronous API, job lifecycle, settings, and pipeline serialization.
+- `src/toresu/viewer.py`: local Streamlit PDF/provenance viewer.
+- `src/toresu/document_intelligence.py`: cross-statement links, cross-period comparisons, and explainable consistency findings.
+- `src/toresu/evaluation.py` and `src/toresu/research.py`: versioned evaluation, benchmarking, and the reproducible baseline experiment.
+- `evaluation/`: annotation schema and versioned synthetic fixture.
+- `tests/`: unit and integration coverage for the pipeline, API, viewer, evaluation, and research reporting.
 
 ## References
 
@@ -431,4 +531,4 @@ This is a suggested layout; module names can change as the implementation evolve
 
 ## Status
 
-Toresu is a research-oriented implementation in progress. Implemented: PyMuPDF PDF ingestion with page-numbered native text spans and conditional lazy RapidOCR; the deterministic Japanese context compiler; geometry-based table candidate reconstruction with source-backed and unresolved cells; Decimal-based value/unit/period normalization; and deterministic financial validation with a balance-sheet invariant, configurable equations/tolerances, and warning-only cross-period thresholds. Tests use synthetic evidence only; no real financial PDF has been evaluated, and no accuracy or benchmark claim is made. Reconstruction remains geometry-driven; semantic mapping is exact-registry based; validation requires compatible resolved evidence and does not modify source values. Proposed: Streamlit review and exports.
+Toresu is a research-oriented implementation in progress. Implemented: PyMuPDF ingestion with conditional RapidOCR; deterministic Japanese context compilation, table reconstruction, financial normalization, and validation; a bounded local API; a provenance-oriented Streamlit viewer; document-level financial reporting; and versioned evaluation, benchmarking, and research tooling. Validation, evaluation, and research results currently use synthetic evidence only: no real financial PDF has been evaluated, and synthetic scores do not establish real-world accuracy or statistical significance. The benchmark measures this machine and workload only. Narrative-to-table reconciliation, restatement inference, switchable causal ablations, and silent-error-rate analysis are not available. The API has no authentication and uses in-memory job metadata; do not expose it publicly without the documented production controls.

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -92,6 +93,7 @@ class ColumnResponse(APIModel):
     period_label_raw: str | None
     period_status: str
     geometry_status: str
+    is_auxiliary: bool = False
 
 
 class RowResponse(APIModel):
@@ -112,6 +114,7 @@ class TableResponse(APIModel):
     columns: tuple[ColumnResponse, ...]
     header_rows: tuple[tuple[HeaderResponse, ...], ...]
     rows: tuple[RowResponse, ...]
+    context_spans: tuple[SpanResponse, ...]
     status: str
     issues: tuple[str, ...]
 
@@ -133,6 +136,7 @@ class NormalizedObservationResponse(APIModel):
     row_id: str
     cell_id: str
     row_label_raw: str | None
+    row_label_source_spans: tuple[SpanResponse, ...]
     metric_candidates: tuple[str, ...]
     metric_status: str
     metric_issue: str | None
@@ -148,6 +152,7 @@ class NormalizedObservationResponse(APIModel):
     unit_status: str
     issue: str | None
     source_spans: tuple[SpanResponse, ...]
+    unit_source_spans: tuple[SpanResponse, ...]
 
 
 class ValidationEvidenceResponse(APIModel):
@@ -204,6 +209,7 @@ class ProcessingResultResponse(APIModel):
     validation_findings: tuple[ValidationFindingResponse, ...] = ()
     stage_errors: tuple[StageResponse, ...] = ()
     warnings: tuple[str, ...] = ()
+    document_report: dict[str, Any] | None = None
 
 
 class ValidationResultResponse(APIModel):

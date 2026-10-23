@@ -1,0 +1,11 @@
+{
+  "dataset_version": "1.0.0",
+  "documents": [
+    {
+      "document_id": "synthetic-jp-income-v1",
+      "source_kind": "synthetic_pdf",
+      "source_file": "sources/synthetic-jp-income.json",
+      "annotation_file": "annotations/synthetic-jp-income.json"
+    }
+  ]
+}

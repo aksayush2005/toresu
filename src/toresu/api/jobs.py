@@ -94,9 +94,8 @@ class JobManager:
         self.settings = settings
         self._runner = runner
         self._lock = threading.RLock()
-        self._capacity = threading.BoundedSemaphore(
-            settings.max_workers + settings.max_queued_jobs
-        )
+        self._capacity = settings.max_workers + settings.max_queued_jobs
+        self._reserved_slots = 0
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_workers,
             thread_name_prefix="toresu-api",
@@ -118,54 +117,47 @@ class JobManager:
     @property
     def available_job_slots(self) -> int:
         with self._lock:
-            return max(
-                0,
-                self.settings.max_workers
-                + self.settings.max_queued_jobs
-                - sum(job.state not in _TERMINAL_STATES for job in self._jobs.values()),
-            )
+            return self._capacity - self._reserved_slots
 
     def submit(self, source_path: Path) -> JobRecord:
-        if not self._capacity.acquire(blocking=False):
-            raise JobCapacityError("The API job queue is full; retry later.")
         with self._lock:
             if self._closed:
-                self._capacity.release()
                 raise JobCapacityError("The API is shutting down and is not accepting jobs.")
+            if self._reserved_slots >= self._capacity:
+                raise JobCapacityError("The API job queue is full; retry later.")
             self._prune_terminal_jobs_locked()
             if len(self._jobs) >= self.settings.max_retained_jobs:
-                self._capacity.release()
                 raise JobCapacityError("The retained job limit is full; retry after cleanup.")
-            job_id = str(uuid.uuid4())
-            job_directory = self.jobs_dir / job_id
-            job_directory.mkdir(mode=0o700)
-            stored_source = job_directory / "source.pdf"
+            self._reserved_slots += 1
+            job_directory: Path | None = None
+            job_id: str | None = None
             try:
+                job_id = str(uuid.uuid4())
+                job_directory = self.jobs_dir / job_id
+                job_directory.mkdir(mode=0o700)
+                stored_source = job_directory / "source.pdf"
                 os.replace(source_path, stored_source)
-            except Exception:
-                shutil.rmtree(job_directory, ignore_errors=True)
-                self._capacity.release()
-                raise
-            now = _now()
-            record = JobRecord(
-                job_id=job_id,
-                directory=job_directory,
-                source_path=stored_source,
-                state=JobState.QUEUED,
-                created_at=now,
-                updated_at=now,
-                stages={
-                    stage: StageResponse(name=stage, state=StageState.QUEUED)
-                    for stage in _STAGE_ORDER
-                },
-            )
-            self._jobs[job_id] = record
-            try:
+                now = _now()
+                record = JobRecord(
+                    job_id=job_id,
+                    directory=job_directory,
+                    source_path=stored_source,
+                    state=JobState.QUEUED,
+                    created_at=now,
+                    updated_at=now,
+                    stages={
+                        stage: StageResponse(name=stage, state=StageState.QUEUED)
+                        for stage in _STAGE_ORDER
+                    },
+                )
+                self._jobs[job_id] = record
                 record.future = self._executor.submit(self._run_job, record)
             except Exception:
-                self._jobs.pop(job_id, None)
-                shutil.rmtree(job_directory, ignore_errors=True)
-                self._capacity.release()
+                if job_id is not None:
+                    self._jobs.pop(job_id, None)
+                if job_directory is not None:
+                    shutil.rmtree(job_directory, ignore_errors=True)
+                self._reserved_slots -= 1
                 raise
             return record
 
@@ -276,22 +268,24 @@ class JobManager:
             self._transition_job(record, JobState.FAILED)
         finally:
             with self._lock:
-                record.updated_at = _now()
-                self._write_result_locked(
-                    record,
-                    result_response(
-                        record.job_id,
-                        record.state,
-                        record.artifacts,
-                        tuple(
-                            record.stages[stage]
-                            for stage in _STAGE_ORDER
-                            if record.stages[stage].state is StageState.FAILED
+                try:
+                    record.updated_at = _now()
+                    self._write_result_locked(
+                        record,
+                        result_response(
+                            record.job_id,
+                            record.state,
+                            record.artifacts,
+                            tuple(
+                                record.stages[stage]
+                                for stage in _STAGE_ORDER
+                                if record.stages[stage].state is StageState.FAILED
+                            ),
+                            record.failed_stage,
                         ),
-                        record.failed_stage,
                     ),
-                )
-                self._capacity.release()
+                finally:
+                    self._reserved_slots -= 1
 
     def _transition_job(self, record: JobRecord, state: JobState) -> None:
         with self._lock:

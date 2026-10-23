@@ -222,9 +222,9 @@ _SECTION_HEADINGS = (
 )
 _DATE_RE = re.compile(
     r"(?:(?P<era>令和|平成|昭和|大正|明治)"
-    r"(?P<era_year>元|\d+)年(?P<era_month>\d{1,2})月(?P<era_day>\d{1,2})日"
-    r"|(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
-    r"|(?P<slash_year>\d{4})[/-](?P<slash_month>\d{1,2})[/-]"
+    r"(?P<era_year>元|\d+)\s*年\s*(?P<era_month>\d{1,2})\s*月\s*(?P<era_day>\d{1,2})\s*日"
+    r"|(?P<year>\d{4})\s*年\s*(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日"
+    r"|(?P<slash_year>\d{4})\s*[/-]\s*(?P<slash_month>\d{1,2})\s*[/-]\s*"
     r"(?P<slash_day>\d{1,2}))"
 )
 _UNIT_RE = re.compile(

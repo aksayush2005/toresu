@@ -1,0 +1,117 @@
+{
+  "document_id": "synthetic-jp-income-v1",
+  "document_metadata": {
+    "title": "Synthetic Japanese consolidated income statement",
+    "language": "ja",
+    "synthetic": true
+  },
+  "annotation_status": "complete",
+  "processing_metadata": {
+    "source_kind": "synthetic_pdf",
+    "text_layer": "native"
+  },
+  "text_reference": [
+    "連結損益計算書",
+    "（単位：千円）",
+    "前連結会計年度",
+    "当連結会計年度",
+    "売上高",
+    "1,234.50",
+    "2,500",
+    "営業利益",
+    "△250",
+    "300"
+  ],
+  "context": {
+    "statement_titles": ["連結損益計算書"],
+    "section_headings": ["売上高", "営業利益"],
+    "reporting_periods": ["前連結会計年度", "当連結会計年度"],
+    "units": ["（単位：千円）"],
+    "footnotes": []
+  },
+  "tables": [
+    {
+      "page_number": 1,
+      "row_labels": ["売上高", "営業利益"],
+      "periods": ["前連結会計年度", "当連結会計年度"],
+      "header_rows": [["前連結会計年度", "当連結会計年度"]],
+      "columns": [
+        {"period": "前連結会計年度", "header_path": ["前連結会計年度"]},
+        {"period": "当連結会計年度", "header_path": ["当連結会計年度"]}
+      ],
+      "cells": [
+        {
+          "row_label": "売上高",
+          "period": "前連結会計年度",
+          "period_kind": "relative_fiscal_year",
+          "relative_period": "prior",
+          "raw_value": "1,234.50",
+          "parsed_value": "1234.50",
+          "normalized_value": "1234500.00",
+          "normalized_unit": "yen",
+          "value_kind": "amount",
+          "metric": "revenue",
+          "extraction_source": "pdf_text",
+          "page_number": 1
+        },
+        {
+          "row_label": "売上高",
+          "period": "当連結会計年度",
+          "period_kind": "relative_fiscal_year",
+          "relative_period": "current",
+          "raw_value": "2,500",
+          "parsed_value": "2500",
+          "normalized_value": "2500000",
+          "normalized_unit": "yen",
+          "value_kind": "amount",
+          "metric": "revenue",
+          "extraction_source": "pdf_text",
+          "page_number": 1
+        },
+        {
+          "row_label": "営業利益",
+          "period": "前連結会計年度",
+          "period_kind": "relative_fiscal_year",
+          "relative_period": "prior",
+          "raw_value": "△250",
+          "parsed_value": "-250",
+          "normalized_value": "-250000",
+          "normalized_unit": "yen",
+          "value_kind": "amount",
+          "metric": "operating_income",
+          "extraction_source": "pdf_text",
+          "page_number": 1
+        },
+        {
+          "row_label": "営業利益",
+          "period": "当連結会計年度",
+          "period_kind": "relative_fiscal_year",
+          "relative_period": "current",
+          "raw_value": "300",
+          "parsed_value": "300",
+          "normalized_value": "300000",
+          "normalized_unit": "yen",
+          "value_kind": "amount",
+          "metric": "operating_income",
+          "extraction_source": "pdf_text",
+          "page_number": 1
+        }
+      ]
+    }
+  ],
+  "validation_findings": null,
+  "exhaustive": {
+    "text_reference": true,
+    "validation_findings": true,
+    "context_statement_titles": true,
+    "context_section_headings": true,
+    "context_reporting_periods": true,
+    "context_units": true,
+    "context_footnotes": true,
+    "table_detection": true,
+    "table_row_labels": true,
+    "table_periods": true,
+    "table_header_texts": true,
+    "table_cells": true
+  }
+}

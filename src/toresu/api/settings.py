@@ -3,6 +3,8 @@ from decimal import Decimal, InvalidOperation
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 @dataclass(frozen=True)
 class APISettings:
@@ -34,6 +36,7 @@ class APISettings:
 
     @classmethod
     def from_env(cls) -> "APISettings":
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
         return cls(
             data_dir=Path(os.getenv("TORESU_API_DATA_DIR", ".toresu-data")),
             max_upload_bytes=_env_int("TORESU_API_MAX_UPLOAD_BYTES", 50 * 1024 * 1024),

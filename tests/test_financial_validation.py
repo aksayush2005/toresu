@@ -36,6 +36,7 @@ from toresu.financial_validation import (
     ValidationConfig,
     validate_financial_data,
 )
+from toresu.document_intelligence import build_document_report
 from toresu.pdf_ingestion import ExtractionSource, TextSpan
 from toresu.table_reconstruction import (
     AssignmentStatus,
@@ -247,6 +248,185 @@ def test_balanced_and_unbalanced_balance_sheet_invariant():
     unbalanced = next(item for item in failed.findings if item.rule_id == BALANCE_SHEET_EQUATION.rule_id)
     assert unbalanced.status is FindingStatus.FAILED
     assert unbalanced.observed_residual == Decimal("10")
+
+
+def test_document_report_explains_validation_relationship_and_actual_inputs():
+    validation = validate_financial_data(
+        _balance_sheet(Decimal("1000"), Decimal("600"), Decimal("390"))
+    )
+
+    finding = next(
+        item
+        for item in build_document_report(
+            _balance_sheet(Decimal("1000"), Decimal("600"), Decimal("390")),
+            validation,
+        )["consistency_findings"]
+        if item["rule_id"] == BALANCE_SHEET_EQUATION.rule_id
+    )
+
+    assert finding["expected_relationship"] == (
+        "Total assets = total liabilities + equity."
+    )
+    assert finding["actual_result"]["observed_residual"] == "10"
+    assert finding["actual_result"]["tolerance"] == "0"
+    assert {
+        item["normalized_value"]
+        for item in finding["actual_result"]["observations"]
+    } == {"1000", "600", "390"}
+    assert all(
+        item["reference"]["cell_id"]
+        for item in finding["actual_result"]["observations"]
+    )
+
+
+def test_document_report_links_compatible_statements_with_source_references():
+    report = build_document_report(
+        _result(
+            _observation(
+                MetricConcept.OPERATING_CASH_FLOW,
+                "営業活動によるキャッシュ・フロー",
+                Decimal("125"),
+                statement_type=StatementType.CONSOLIDATED_CASH_FLOW_STATEMENT,
+                table_id="cash-flow-consolidated",
+            ),
+            _observation(
+                MetricConcept.OPERATING_CASH_FLOW,
+                "営業活動によるキャッシュ・フロー",
+                Decimal("125"),
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+                table_id="cash-flow-separate",
+            ),
+        )
+    )
+
+    link = report["cross_statement_links"][0]
+
+    assert link["status"] == "linked"
+    assert link["metric"] == "operating_cash_flow"
+    assert len(link["observations"]) == 2
+    assert all(item["reference"]["cell_id"] for item in link["observations"])
+    assert link["provenance"]
+
+
+def test_document_report_computes_decimal_cross_period_changes_and_zero_base():
+    report = build_document_report(
+        _result(
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("100.10"),
+                fiscal_year=2024,
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+            ),
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("125.15"),
+                fiscal_year=2025,
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+                table_id="income-2025",
+            ),
+        )
+    )
+
+    comparison = report["cross_period_comparisons"][0]
+
+    assert comparison["status"] == "compared"
+    assert comparison["absolute_change"] == "25.05"
+    assert comparison["percentage_change"] == "25.02497502497502497502497502"
+    assert comparison["prior"]["normalized_value"] == "100.10"
+    assert comparison["current"]["normalized_value"] == "125.15"
+
+    zero_base = build_document_report(
+        _result(
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal(0),
+                fiscal_year=2024,
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+            ),
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("10"),
+                fiscal_year=2025,
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+                table_id="income-2025",
+            ),
+        )
+    )
+    assert zero_base["cross_period_comparisons"][0]["absolute_change"] == "10"
+    assert zero_base["cross_period_comparisons"][0]["percentage_change"] is None
+
+
+def test_document_report_keeps_incompatible_units_and_period_families_uncompared():
+    unit_report = build_document_report(
+        _result(
+            _observation(
+                MetricConcept.OPERATING_CASH_FLOW,
+                "営業活動によるキャッシュ・フロー",
+                Decimal("12"),
+                statement_type=StatementType.CONSOLIDATED_CASH_FLOW_STATEMENT,
+                table_id="flow-consolidated",
+            ),
+            _observation(
+                MetricConcept.OPERATING_CASH_FLOW,
+                "営業活動によるキャッシュ・フロー",
+                Decimal("12"),
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+                unit=FinancialUnit.THOUSAND_YEN,
+                table_id="flow-separate",
+            ),
+        )
+    )
+    assert unit_report["cross_statement_links"][0]["status"] == "incompatible_units"
+
+    period_report = build_document_report(
+        _result(
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("100"),
+                fiscal_year=2025,
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+            ),
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("100"),
+                period_kind=NormalizedPeriodKind.QUARTER,
+                fiscal_year=2025,
+                quarter=1,
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+                table_id="income-quarter-1",
+            ),
+        )
+    )
+    assert period_report["cross_period_comparisons"][0]["status"] == "incompatible_period_families"
+
+
+def test_document_report_does_not_link_consolidated_and_separate_statements():
+    report = build_document_report(
+        _result(
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("100"),
+                statement_type=StatementType.CONSOLIDATED_INCOME_STATEMENT,
+                table_id="income-consolidated",
+            ),
+            _observation(
+                MetricConcept.REVENUE,
+                "売上高",
+                Decimal("100"),
+                statement_type=StatementType.INCOME_STATEMENT,
+                table_id="income-separate",
+            ),
+        )
+    )
+
+    assert report["cross_statement_links"][0]["status"] == "incompatible_statement_scope"
 
 
 def test_missing_dash_and_blank_evidence_prevent_equation_check():

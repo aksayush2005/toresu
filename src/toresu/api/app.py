@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -84,11 +85,12 @@ def create_app(
     @application.get("/ready", response_model=ReadinessResponse, tags=["health"])
     async def readiness(request: Request) -> ReadinessResponse:
         manager: JobManager = request.app.state.job_manager
-        accepting = manager.accepting_jobs
+        available_slots = manager.available_job_slots
+        accepting = manager.accepting_jobs and available_slots > 0
         return ReadinessResponse(
             status="ready" if accepting else "not_ready",
             accepting_jobs=accepting,
-            available_worker_slots=manager.available_job_slots,
+            available_worker_slots=available_slots,
         )
 
     @application.get("/v1/config", response_model=APISettingsResponse, tags=["health"])
@@ -121,6 +123,7 @@ def create_app(
         prefix = bytearray()
         try:
             with staged_file.open("xb") as output:
+                os.chmod(staged_file, 0o600)
                 while chunk := await file.read(_CHUNK_BYTES):
                     total_bytes += len(chunk)
                     if total_bytes > configured.max_upload_bytes:

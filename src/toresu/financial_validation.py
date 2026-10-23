@@ -108,6 +108,7 @@ class ValidationFinding:
     metric_concepts: tuple[MetricConcept, ...] = ()
     observed_residual: Decimal | None = None
     tolerance: Decimal | None = None
+    expected_relationship: str | None = None
 
 
 @dataclass(frozen=True)
@@ -535,6 +536,7 @@ def _evaluate_equation_group(
                 metric_concepts=tuple(term.concept for term in terms),
                 residual=residual,
                 tolerance=tolerance,
+                expected_relationship=equation.description,
             )
         )
     return findings
@@ -625,6 +627,7 @@ def _finding(
     metric_concepts: tuple[MetricConcept, ...] = (),
     residual: Decimal | None = None,
     tolerance: Decimal | None = None,
+    expected_relationship: str | None = None,
 ) -> ValidationFinding:
     unique_observations = tuple(_unique_by_identity(observations))
     tables = tuple(_unique_by_identity(item.source_table for item in unique_observations))
@@ -673,6 +676,7 @@ def _finding(
         status=status,
         message=message,
         evidence=evidence,
+        expected_relationship=expected_relationship,
         period_label=" / ".join(period_labels) if period_labels else None,
         metric_concepts=metric_concepts,
         observed_residual=residual,

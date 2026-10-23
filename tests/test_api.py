@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from toresu.api.app import create_app
-from toresu.api.jobs import JobManager
+from toresu.api.jobs import JobCapacityError, JobManager
 from toresu.api.pipeline import PipelineArtifacts, PDFPreflightError
 from toresu.api.schemas import JobState, StageName, StageState
 from toresu.api.settings import APISettings
@@ -60,6 +60,44 @@ def test_health_readiness_and_public_limits(tmp_path):
         assert client.get("/v1/config").json()["max_upload_bytes"] == 1234
 
 
+def test_api_settings_read_environment_options(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            (
+                f"TORESU_API_DATA_DIR={tmp_path / 'dotenv-data'}",
+                "TORESU_API_MAX_UPLOAD_BYTES=2048",
+                "TORESU_API_MAX_PDF_PAGES=17",
+                "TORESU_API_MAX_WORKERS=4",
+            )
+        ),
+        encoding="utf-8",
+    )
+    for key in (
+        "TORESU_API_DATA_DIR",
+        "TORESU_API_MAX_UPLOAD_BYTES",
+        "TORESU_API_MAX_PDF_PAGES",
+        "TORESU_API_MAX_WORKERS",
+        "TORESU_API_VALIDATION_ABSOLUTE_TOLERANCE",
+        "TORESU_API_REVENUE_CHANGE_THRESHOLD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TORESU_API_DATA_DIR", str(tmp_path / "configured-data"))
+    monkeypatch.setenv("TORESU_API_MAX_UPLOAD_BYTES", "4096")
+    monkeypatch.setenv("TORESU_API_MAX_WORKERS", "3")
+    monkeypatch.setenv("TORESU_API_VALIDATION_ABSOLUTE_TOLERANCE", "0.25")
+    monkeypatch.setenv("TORESU_API_REVENUE_CHANGE_THRESHOLD", "0.75")
+
+    configured = APISettings.from_env()
+
+    assert configured.data_dir == (tmp_path / "configured-data").resolve()
+    assert configured.max_upload_bytes == 4096
+    assert configured.max_pdf_pages == 17
+    assert configured.max_workers == 3
+    assert str(configured.validation_absolute_tolerance) == "0.25"
+    assert str(configured.revenue_change_threshold) == "0.75"
+
+
 def test_synthetic_pdf_completes_pipeline_and_serializes_decimal_as_string(tmp_path):
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
@@ -71,6 +109,8 @@ def test_synthetic_pdf_completes_pipeline_and_serializes_decimal_as_string(tmp_p
         stored_sources = list((tmp_path / "api-data" / "jobs").glob("*/source.pdf"))
         assert len(stored_sources) == 1
         assert stored_sources[0].name == "source.pdf"
+        assert stored_sources[0].stat().st_mode & 0o777 == 0o600
+        assert stored_sources[0].parent.stat().st_mode & 0o777 == 0o700
 
         status_response = _wait_for_job(client, payload["job_id"])
         assert status_response.status_code == 200
@@ -98,6 +138,12 @@ def test_synthetic_pdf_completes_pipeline_and_serializes_decimal_as_string(tmp_p
         assert observation["source_spans"]
         assert observation["source_spans"][0]["page_number"] == 1
         assert observation["source_spans"][0]["bounding_box"]
+        assert observation["row_label_source_spans"]
+        assert observation["row_label_source_spans"][0]["page_number"] == 1
+        assert "unit_source_spans" in observation
+        assert isinstance(result["tables"][0]["context_spans"], list)
+        assert result["document_report"]["report_version"] == "1"
+        assert "cross_period_comparisons" in result["document_report"]
 
         validation = client.get(payload["validation_url"])
         assert validation.status_code == 200
@@ -278,11 +324,22 @@ def test_running_job_returns_conflict_for_results_and_queue_is_bounded(tmp_path)
         assert entered.wait(timeout=3)
         assert client.get(f"/v1/jobs/{first_id}").json()["state"] == "processing"
         assert client.get(f"/v1/jobs/{first_id}/result").status_code == 409
+        readiness = client.get("/ready").json()
+        assert readiness["status"] == "not_ready"
+        assert not readiness["accepting_jobs"]
+        assert readiness["available_worker_slots"] == 0
         second = _upload(client, _pdf_bytes())
         assert second.status_code == 503
         assert second.json()["error_code"] == "job_capacity_exceeded"
         release.set()
         assert _wait_for_job(client, first_id).json()["state"] == "completed"
+        recovered = client.get("/ready").json()
+        assert recovered["status"] == "ready"
+        assert recovered["accepting_jobs"]
+        assert recovered["available_worker_slots"] == 1
+        accepted = _upload(client, _pdf_bytes())
+        assert accepted.status_code == 202
+        assert _wait_for_job(client, accepted.json()["job_id"]).json()["state"] == "completed"
 
 
 def test_job_manager_state_transitions_are_deterministic(tmp_path):
@@ -300,6 +357,35 @@ def test_job_manager_state_transitions_are_deterministic(tmp_path):
         manager.close()
 
 
+def test_job_manager_rejects_submissions_after_shutdown(tmp_path):
+    manager = JobManager(_settings(tmp_path))
+    manager.close()
+
+    upload_path = tmp_path / "incoming.pdf"
+    upload_path.write_bytes(_pdf_bytes())
+    assert not manager.accepting_jobs
+    with pytest.raises(JobCapacityError, match="shutting down"):
+        manager.submit(upload_path)
+    assert upload_path.exists()
+
+
+def test_job_manager_removes_stale_artifacts_after_restart(tmp_path):
+    settings = _settings(tmp_path)
+    stale_job = settings.data_dir / "jobs" / "old-job"
+    stale_upload = settings.data_dir / "staging" / "old-upload"
+    stale_job.mkdir(parents=True)
+    stale_upload.mkdir(parents=True)
+    (stale_job / "result.json").write_text("{}", encoding="utf-8")
+    (stale_upload / "upload.bin").write_bytes(b"partial")
+
+    manager = JobManager(settings)
+    try:
+        assert list(manager.jobs_dir.iterdir()) == []
+        assert list(manager.staging_dir.iterdir()) == []
+    finally:
+        manager.close()
+
+
 def test_decimal_response_model_serializes_values_as_strings():
     from decimal import Decimal
 
@@ -310,6 +396,7 @@ def test_decimal_response_model_serializes_values_as_strings():
         row_id="r1",
         cell_id="c1",
         row_label_raw="売上高",
+        row_label_source_spans=(),
         metric_candidates=("revenue",),
         metric_status="inferred",
         metric_issue=None,
@@ -333,6 +420,7 @@ def test_decimal_response_model_serializes_values_as_strings():
         unit_status="resolved",
         issue=None,
         source_spans=(),
+        unit_source_spans=(),
     )
 
     encoded = model.model_dump_json()

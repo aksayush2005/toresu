@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toresu.invalid/evaluation/annotation-v1.schema.json",
+  "title": "Toresu evaluation annotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "document_id",
+    "document_metadata",
+    "annotation_status",
+    "text_reference",
+    "context",
+    "tables",
+    "validation_findings",
+    "exhaustive"
+  ],
+  "properties": {
+    "document_id": {"type": "string", "minLength": 1},
+    "document_metadata": {"type": "object"},
+    "annotation_status": {
+      "enum": ["complete", "partial", "unannotated"]
+    },
+    "processing_metadata": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object"}
+      ]
+    },
+    "text_reference": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "statement_titles",
+        "section_headings",
+        "reporting_periods",
+        "units",
+        "footnotes"
+      ],
+      "properties": {
+        "statement_titles": {"$ref": "#/$defs/stringList"},
+        "section_headings": {"$ref": "#/$defs/stringList"},
+        "reporting_periods": {"$ref": "#/$defs/stringList"},
+        "units": {"$ref": "#/$defs/stringList"},
+        "footnotes": {"$ref": "#/$defs/stringList"}
+      },
+      "additionalProperties": false
+    },
+    "tables": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["page_number", "row_labels", "periods", "header_rows", "cells"],
+        "properties": {
+          "page_number": {"type": ["integer", "null"], "minimum": 1},
+          "row_labels": {"$ref": "#/$defs/stringList"},
+          "periods": {"$ref": "#/$defs/stringList"},
+          "header_rows": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/stringList"}
+          },
+          "columns": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/column"}
+          },
+          "bounding_box": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {"type": "number"}
+              }
+            ]
+          },
+          "cells": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/cell"}
+          }
+        }
+      }
+    },
+    "validation_findings": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rule_id", "status"],
+            "properties": {
+              "rule_id": {"type": "string"},
+              "status": {"type": "string"},
+              "period_label": {"type": ["string", "null"]}
+            }
+          }
+        }
+      ]
+    },
+    "exhaustive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text_reference",
+        "validation_findings",
+        "context_statement_titles",
+        "context_section_headings",
+        "context_reporting_periods",
+        "context_units",
+        "context_footnotes",
+        "table_detection",
+        "table_row_labels",
+        "table_periods",
+        "table_header_texts",
+        "table_cells"
+      ],
+      "properties": {
+        "text_reference": {"type": "boolean"},
+        "validation_findings": {"type": "boolean"},
+        "context_statement_titles": {"type": "boolean"},
+        "context_section_headings": {"type": "boolean"},
+        "context_reporting_periods": {"type": "boolean"},
+        "context_units": {"type": "boolean"},
+        "context_footnotes": {"type": "boolean"},
+        "table_row_labels": {"type": "boolean"},
+        "table_periods": {"type": "boolean"},
+        "table_header_texts": {"type": "boolean"},
+        "table_cells": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "stringList": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["period", "header_path"],
+      "properties": {
+        "period": {"type": ["string", "null"]},
+        "header_path": {"$ref": "#/$defs/stringList"},
+        "bounding_box": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {"type": "number"}
+            }
+          ]
+        }
+      }
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_label",
+        "period",
+        "raw_value",
+        "parsed_value",
+        "normalized_value",
+        "normalized_unit",
+        "value_kind",
+        "metric",
+        "page_number"
+      ],
+      "properties": {
+        "row_label": {"type": "string"},
+        "period": {"type": "string"},
+        "period_kind": {"type": ["string", "null"]},
+        "fiscal_year": {"type": ["integer", "null"]},
+        "quarter": {"type": ["integer", "null"]},
+        "relative_period": {"type": ["string", "null"]},
+        "date_iso": {"type": ["string", "null"]},
+        "raw_value": {"type": ["string", "null"]},
+        "parsed_value": {"type": ["string", "null"]},
+        "normalized_value": {"type": ["string", "null"]},
+        "normalized_unit": {"type": ["string", "null"]},
+        "value_kind": {"type": "string"},
+        "metric": {"type": ["string", "null"]},
+        "extraction_source": {"type": ["string", "null"]},
+        "page_number": {"type": ["integer", "null"], "minimum": 1},
+        "annotation_status": {
+          "enum": ["resolved", "ambiguous", "missing", "unresolvable"]
+        },
+        "issue": {"type": ["string", "null"]},
+        "bounding_box": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {"type": "number"}
+            }
+          ]
+        }
+      }
+    }
+  }
+}

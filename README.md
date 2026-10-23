@@ -1,5 +1,7 @@
 # Toresu — Japanese Financial Document Intelligence
 
+See demonstration:[https://youtu.be/EicxWVr59dg]
+
 Toresu is a research-oriented document-intelligence project for reconstructing **Japanese-language financial tables** from PDFs into structured, traceable data. Its initial target is the financial-statement tables found in Japanese corporate disclosures, especially annual securities reports (*有価証券報告書*) and consolidated financial statements.
 
 Toresu combines native PDF text extraction, Japanese OCR, table-structure recognition, and a vision-language model (VLM). Its defining component is a **Japanese Financial Context Compiler**: it extracts document-specific evidence and applies Japanese financial-document conventions before asking the VLM to interpret a table.
